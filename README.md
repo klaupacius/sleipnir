@@ -5,12 +5,16 @@ A minimal Go multi-agent LLM orchestration harness.
 > In Norse mythology, *Sleipnir* is Odin's eight-legged horse, on which he
 > rides across sky and sea.
 
+## Use of AI
+
+This software is developed with the assistance of AI.
+
 ## Status
 
 **Pre-alpha.** Design complete; implementation in progress. Not yet usable.
 
 See [`docs/plans/2026-04-22-sleipnir-architecture-design.md`](docs/plans/2026-04-22-sleipnir-architecture-design.md)
-for the architecture and [`DESIGN.md`](DESIGN.md) for the concept summary.
+for the architecture.
 
 ## What it is
 
