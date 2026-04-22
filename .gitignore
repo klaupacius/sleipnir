@@ -1,0 +1,35 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries and coverage
+*.test
+*.out
+coverage.html
+coverage.txt
+
+# Go workspace and vendored deps
+go.work
+go.work.sum
+/vendor/
+
+# Build artifacts
+/bin/
+/dist/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
