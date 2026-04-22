@@ -33,3 +33,7 @@ Thumbs.db
 # Environment
 .env
 .env.local
+
+# Ephemeral progress notes
+PROGRESS.md
+
