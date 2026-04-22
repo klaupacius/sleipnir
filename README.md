@@ -2,8 +2,8 @@
 
 A minimal Go multi-agent LLM orchestration harness.
 
-> In Norse mythology, *Sleipnir* is Odin's eight-legged horse, on which he can
-> ride across sky and sea.
+> In Norse mythology, *Sleipnir* is Odin's eight-legged horse, on which he
+> rides across sky and sea.
 
 ## Status
 
