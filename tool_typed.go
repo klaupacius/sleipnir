@@ -26,8 +26,6 @@ func (t *typedTool[T]) Invoke(ctx context.Context, args json.RawMessage) (ToolRe
 	return t.fn(ctx, input)
 }
 
-// NewTypedTool constructs a Tool from a typed handler function. The input schema
-// is generated automatically from T via JSON Schema reflection.
 func NewTypedTool[T any](name, desc string, fn func(context.Context, T) (ToolResult, error)) (Tool, error) {
 	inputSchema, err := schema.Reflect[T]()
 	if err != nil {
