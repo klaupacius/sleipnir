@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+
+	anyllm "github.com/mozilla-ai/any-llm-go"
 )
 
 // Tool defines the behaviour of an agent tool
@@ -40,4 +42,21 @@ func validateToolNames(tools []Tool) error {
 		seen[name] = struct{}{}
 	}
 	return nil
+}
+
+// Maps each Tools ToolDefinition to
+// anyllm.Tool{Type: "function", Function: anyllm.Function{Name, Description,Parameters}}
+func toolsToAnyllm(tools []Tool) []anyllm.Tool {
+	var mappedTools []anyllm.Tool
+	for _, t := range tools {
+		mappedTools = append(mappedTools, anyllm.Tool{
+			Type: "function",
+			Function: anyllm.Function{
+				Name:        t.Definition().Name,
+				Description: t.Definition().Description,
+				Parameters:  t.Definition().InputSchema,
+			},
+		})
+	}
+	return mappedTools
 }
