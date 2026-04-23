@@ -2,6 +2,7 @@ package sleipnir
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -142,6 +143,11 @@ func (h *Harness) runLoop(ctx context.Context, in RunInput, spec AgentSpec, info
 		return RunOutput{}, err
 	}
 
+	toolMap := make(map[string]Tool, len(allTools))
+	for _, t := range allTools {
+		toolMap[t.Definition().Name] = t
+	}
+
 	emit(in.Events, AgentStartEvent{AgentName: spec.Name, ParentName: info.ParentName})
 
 	history := make([]anyllm.Message, 0, len(in.History)+8)
@@ -188,6 +194,13 @@ func (h *Harness) runLoop(ctx context.Context, in RunInput, spec AgentSpec, info
 		totalUsage.OutputTokens += resp.Usage.OutputTokens
 		totalUsage.TotalTokens += resp.Usage.TotalTokens
 
+		if resp.Message.Content != "" {
+			emit(in.Events, TokenEvent{AgentName: spec.Name, Text: resp.Message.ContentString()})
+		}
+		if resp.Message.Reasoning != nil && resp.Message.Reasoning.Content != "" {
+			emit(in.Events, ThinkingEvent{AgentName: spec.Name, Text: resp.Message.Reasoning.Content})
+		}
+
 		history = append(history, resp.Message)
 
 		if len(resp.Message.ToolCalls) == 0 {
@@ -201,12 +214,70 @@ func (h *Harness) runLoop(ctx context.Context, in RunInput, spec AgentSpec, info
 			return out, nil
 		}
 
-		// Tool dispatch not yet implemented (StubProvider never returns tool calls)
-		return RunOutput{}, fmt.Errorf("sleipnir: tool dispatch not yet implemented")
+		toolResults := dispatchSequential(ctx, resp.Message.ToolCalls, toolMap, spec.Name, in.Events)
+		history = append(history, toolResultMessages(toolResults)...)
 	}
 
 	emit(in.Events, AgentEndEvent{AgentName: spec.Name, Usage: totalUsage, Stopped: StopIterationBudget})
 	return RunOutput{Messages: history, Usage: totalUsage, Stopped: StopIterationBudget}, ErrIterationBudget
+}
+
+type toolCallResult struct {
+	callID   string
+	result   ToolResult
+	infraErr error
+}
+
+func dispatchSequential(
+	ctx context.Context,
+	calls []anyllm.ToolCall,
+	toolMap map[string]Tool,
+	agentName string,
+	sink Sink,
+) []toolCallResult {
+	results := make([]toolCallResult, len(calls))
+	for i, call := range calls {
+		emit(sink, ToolCallEvent{
+			AgentName:  agentName,
+			ToolCallID: call.ID,
+			ToolName:   call.Function.Name,
+			Args:       json.RawMessage(call.Function.Arguments),
+		})
+
+		tool, ok := toolMap[call.Function.Name]
+		var res ToolResult
+		var infraErr error
+		if !ok {
+			res = ToolResult{IsError: true, Content: "unknown tool: " + call.Function.Name}
+		} else {
+			res, infraErr = tool.Invoke(ctx, json.RawMessage(call.Function.Arguments))
+			if infraErr != nil {
+				res = ToolResult{IsError: true, Content: "tool execution failed: " + infraErr.Error()}
+				emit(sink, ErrorEvent{AgentName: agentName, Err: infraErr})
+			}
+		}
+
+		emit(sink, ToolResultEvent{
+			AgentName:  agentName,
+			ToolCallID: call.ID,
+			Result:     res.Content,
+			IsError:    res.IsError,
+		})
+		results[i] = toolCallResult{callID: call.ID, result: res, infraErr: infraErr}
+	}
+	return results
+}
+
+func toolResultMessages(results []toolCallResult) []anyllm.Message {
+	msgs := make([]anyllm.Message, len(results))
+	for i, r := range results {
+		msgs[i] = anyllm.Message{
+			Role:       anyllm.RoleTool,
+			Content:    r.result.Content,
+			ToolCallID: r.callID,
+		}
+	}
+	return msgs
 }
 
 func emit(sink Sink, e Event) {

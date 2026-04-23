@@ -57,6 +57,11 @@ func (c *EventCollector) CheckCompleted() error {
 	return errors.New("no AgentEndEvent with StopDone was received")
 }
 
+// ToolCalls returns all ToolCallEvents collected.
+func (c *EventCollector) ToolCalls() []sleipnir.ToolCallEvent {
+	return ByType[sleipnir.ToolCallEvent](c)
+}
+
 // ByType returns all events in c that are of type T.
 func ByType[T sleipnir.Event](c *EventCollector) []T {
 	c.mu.Lock()

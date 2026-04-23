@@ -2,6 +2,7 @@ package sleipnir_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -248,5 +249,252 @@ func TestHarnessAllowLateRegistration(t *testing.T) {
 
 	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "agent2"}); err != nil {
 		t.Errorf("expected nil with AllowLateRegistration, got %v", err)
+	}
+}
+
+// --- Chunk 8: tool dispatch tests ---
+
+func stubTool(name string, result sleipnir.ToolResult) *sleipnirtest.StubTool {
+	return sleipnirtest.NewStubTool(name, "", nil, func(_ context.Context, _ json.RawMessage) (sleipnir.ToolResult, error) {
+		return result, nil
+	})
+}
+
+// Provider returns ToolCallResponse then TextResponse -> tool invoked once, final text correct, StopDone
+func TestRunSingleToolCall(t *testing.T) {
+	tool := stubTool("search", sleipnir.ToolResult{Content: "result"})
+	stub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("search", "call-1", []byte(`{"q":"hi"}`)),
+		sleipnirtest.TextResponse("done"),
+	)
+	h := mustNewHarness(t, sleipnir.Config{})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "a", MaxIterations: 5, Tools: []sleipnir.Tool{tool}}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+
+	out, err := h.Run(context.Background(), sleipnir.RunInput{AgentName: "a", Prompt: "hi", Router: defaultRouter(stub)})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if out.Text != "done" {
+		t.Errorf("expected Text %q, got %q", "done", out.Text)
+	}
+	if out.Stopped != sleipnir.StopDone {
+		t.Errorf("expected StopDone, got %q", out.Stopped)
+	}
+	if tool.InvokeCount() != 1 {
+		t.Errorf("expected 1 invocation, got %d", tool.InvokeCount())
+	}
+}
+
+// Provider returns a response with two tool calls -> both tools invoked sequentially
+func TestRunMultiToolCall(t *testing.T) {
+	toolA := stubTool("toolA", sleipnir.ToolResult{Content: "a"})
+	toolB := stubTool("toolB", sleipnir.ToolResult{Content: "b"})
+
+	twoCallResp := &anyllm.ChatCompletion{
+		Choices: []anyllm.Choice{{
+			Message: anyllm.Message{
+				Role: anyllm.RoleAssistant,
+				ToolCalls: []anyllm.ToolCall{
+					{ID: "c1", Function: anyllm.FunctionCall{Name: "toolA", Arguments: "{}"}},
+					{ID: "c2", Function: anyllm.FunctionCall{Name: "toolB", Arguments: "{}"}},
+				},
+			},
+			FinishReason: anyllm.FinishReasonToolCalls,
+		}},
+		Usage: &anyllm.Usage{PromptTokens: 10, CompletionTokens: 5},
+	}
+
+	stub := sleipnirtest.NewStubProvider(t, twoCallResp, sleipnirtest.TextResponse("done"))
+	h := mustNewHarness(t, sleipnir.Config{})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{
+		Name: "a", MaxIterations: 5, Tools: []sleipnir.Tool{toolA, toolB},
+	}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+
+	if _, err := h.Run(context.Background(), sleipnir.RunInput{AgentName: "a", Prompt: "hi", Router: defaultRouter(stub)}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if toolA.InvokeCount() != 1 {
+		t.Errorf("toolA: expected 1 invocation, got %d", toolA.InvokeCount())
+	}
+	if toolB.InvokeCount() != 1 {
+		t.Errorf("toolB: expected 1 invocation, got %d", toolB.InvokeCount())
+	}
+}
+
+// Tool returns ToolResult{IsError: true} -> ToolResultEvent.IsError true; loop continues; no ErrorEvent
+func TestRunToolIsError(t *testing.T) {
+	tool := sleipnirtest.NewStubTool("t", "", nil, func(_ context.Context, _ json.RawMessage) (sleipnir.ToolResult, error) {
+		return sleipnir.ToolResult{IsError: true, Content: "structured failure"}, nil
+	})
+	stub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("t", "c1", []byte(`{}`)),
+		sleipnirtest.TextResponse("recovered"),
+	)
+	h := mustNewHarness(t, sleipnir.Config{})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "a", MaxIterations: 5, Tools: []sleipnir.Tool{tool}}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+	collector := sleipnirtest.NewEventCollector()
+
+	out, err := h.Run(context.Background(), sleipnir.RunInput{AgentName: "a", Router: defaultRouter(stub), Events: collector})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if out.Text != "recovered" {
+		t.Errorf("expected Text %q, got %q", "recovered", out.Text)
+	}
+
+	resultEvents := sleipnirtest.ByType[sleipnir.ToolResultEvent](collector)
+	if len(resultEvents) != 1 || !resultEvents[0].IsError {
+		t.Errorf("expected one ToolResultEvent with IsError=true, got %v", resultEvents)
+	}
+	if errs := sleipnirtest.ByType[sleipnir.ErrorEvent](collector); len(errs) != 0 {
+		t.Errorf("expected no ErrorEvent for structured failure, got %d", len(errs))
+	}
+}
+
+// Tool fn returns (ToolResult{}, err) -> harness wraps as IsError=true; ErrorEvent emitted; loop continues
+func TestRunToolInfraError(t *testing.T) {
+	infraErr := errors.New("disk full")
+	tool := sleipnirtest.NewStubTool("t", "", nil, func(_ context.Context, _ json.RawMessage) (sleipnir.ToolResult, error) {
+		return sleipnir.ToolResult{}, infraErr
+	})
+	stub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("t", "c1", []byte(`{}`)),
+		sleipnirtest.TextResponse("ok"),
+	)
+	h := mustNewHarness(t, sleipnir.Config{})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "a", MaxIterations: 5, Tools: []sleipnir.Tool{tool}}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+	collector := sleipnirtest.NewEventCollector()
+
+	out, err := h.Run(context.Background(), sleipnir.RunInput{AgentName: "a", Router: defaultRouter(stub), Events: collector})
+	if err != nil {
+		t.Fatalf("Run should continue after infra error, got %v", err)
+	}
+	if out.Text != "ok" {
+		t.Errorf("expected Text %q, got %q", "ok", out.Text)
+	}
+
+	resultEvents := sleipnirtest.ByType[sleipnir.ToolResultEvent](collector)
+	if len(resultEvents) != 1 || !resultEvents[0].IsError {
+		t.Errorf("expected one ToolResultEvent with IsError=true")
+	}
+	errEvents := sleipnirtest.ByType[sleipnir.ErrorEvent](collector)
+	if len(errEvents) != 1 || !errors.Is(errEvents[0].Err, infraErr) {
+		t.Errorf("expected one ErrorEvent wrapping infraErr, got %v", errEvents)
+	}
+}
+
+// Provider calls unknown tool name -> ToolResultEvent{IsError: true} with "unknown tool:" prefix; no panic
+func TestRunUnknownTool(t *testing.T) {
+	stub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("ghost", "c1", []byte(`{}`)),
+		sleipnirtest.TextResponse("ok"),
+	)
+	h := mustNewHarness(t, sleipnir.Config{})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "a", MaxIterations: 5}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+	collector := sleipnirtest.NewEventCollector()
+
+	if _, err := h.Run(context.Background(), sleipnir.RunInput{AgentName: "a", Router: defaultRouter(stub), Events: collector}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	resultEvents := sleipnirtest.ByType[sleipnir.ToolResultEvent](collector)
+	if len(resultEvents) != 1 {
+		t.Fatalf("expected 1 ToolResultEvent, got %d", len(resultEvents))
+	}
+	if !resultEvents[0].IsError {
+		t.Error("expected IsError=true for unknown tool")
+	}
+	if resultEvents[0].Result == "" {
+		t.Error("expected non-empty content with 'unknown tool:' prefix")
+	}
+}
+
+// EventCollector.ToolCalls() and ByType[ToolResultEvent] return correct counts
+func TestRunToolCallEvents(t *testing.T) {
+	tool := stubTool("search", sleipnir.ToolResult{Content: "r"})
+	stub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("search", "c1", []byte(`{}`)),
+		sleipnirtest.TextResponse("done"),
+	)
+	h := mustNewHarness(t, sleipnir.Config{})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "a", MaxIterations: 5, Tools: []sleipnir.Tool{tool}}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+	collector := sleipnirtest.NewEventCollector()
+
+	if _, err := h.Run(context.Background(), sleipnir.RunInput{AgentName: "a", Router: defaultRouter(stub), Events: collector}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if calls := collector.ToolCalls(); len(calls) != 1 {
+		t.Errorf("expected 1 ToolCallEvent, got %d", len(calls))
+	}
+	if results := sleipnirtest.ByType[sleipnir.ToolResultEvent](collector); len(results) != 1 {
+		t.Errorf("expected 1 ToolResultEvent, got %d", len(results))
+	}
+}
+
+// TextResponse -> TokenEvent emitted with correct text
+func TestRunTokenEvent(t *testing.T) {
+	stub := sleipnirtest.NewStubProvider(t, sleipnirtest.TextResponse("hello world"))
+	h := mustNewHarness(t, sleipnir.Config{})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "a", MaxIterations: 5}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+	collector := sleipnirtest.NewEventCollector()
+
+	if _, err := h.Run(context.Background(), sleipnir.RunInput{AgentName: "a", Prompt: "hi", Router: defaultRouter(stub), Events: collector}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	tokens := sleipnirtest.ByType[sleipnir.TokenEvent](collector)
+	if len(tokens) != 1 {
+		t.Fatalf("expected 1 TokenEvent, got %d", len(tokens))
+	}
+	if tokens[0].Text != "hello world" {
+		t.Errorf("expected Text %q, got %q", "hello world", tokens[0].Text)
+	}
+}
+
+// Response with Reasoning content -> ThinkingEvent emitted
+func TestRunThinkingEvent(t *testing.T) {
+	thinkingResp := &anyllm.ChatCompletion{
+		Choices: []anyllm.Choice{{
+			Message: anyllm.Message{
+				Role:      anyllm.RoleAssistant,
+				Content:   "answer",
+				Reasoning: &anyllm.Reasoning{Content: "let me think"},
+			},
+			FinishReason: anyllm.FinishReasonStop,
+		}},
+		Usage: &anyllm.Usage{PromptTokens: 10, CompletionTokens: 5},
+	}
+	stub := sleipnirtest.NewStubProvider(t, thinkingResp)
+	h := mustNewHarness(t, sleipnir.Config{})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "a", MaxIterations: 5}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+	collector := sleipnirtest.NewEventCollector()
+
+	if _, err := h.Run(context.Background(), sleipnir.RunInput{AgentName: "a", Prompt: "hi", Router: defaultRouter(stub), Events: collector}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	thinking := sleipnirtest.ByType[sleipnir.ThinkingEvent](collector)
+	if len(thinking) != 1 {
+		t.Fatalf("expected 1 ThinkingEvent, got %d", len(thinking))
+	}
+	if thinking[0].Text != "let me think" {
+		t.Errorf("expected Text %q, got %q", "let me think", thinking[0].Text)
 	}
 }

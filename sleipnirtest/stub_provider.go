@@ -2,6 +2,7 @@ package sleipnirtest
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 	"testing"
 
@@ -38,6 +39,26 @@ func (s *StubProvider) Completion(_ context.Context, _ anyllm.CompletionParams) 
 // CompletionStream implements anyllm.Provider - not used in tests; panics with "not implemented"
 func (s *StubProvider) CompletionStream(_ context.Context, _ anyllm.CompletionParams) (<-chan anyllm.ChatCompletionChunk, <-chan error) {
 	panic("StubProvider: CompletionStream not implemented")
+}
+
+// ToolCallResponse returns a *ChatCompletion scripted to call one tool.
+func ToolCallResponse(toolName, toolCallID string, args json.RawMessage) *anyllm.ChatCompletion {
+	return &anyllm.ChatCompletion{
+		Choices: []anyllm.Choice{{
+			Message: anyllm.Message{
+				Role: anyllm.RoleAssistant,
+				ToolCalls: []anyllm.ToolCall{{
+					ID: toolCallID,
+					Function: anyllm.FunctionCall{
+						Name:      toolName,
+						Arguments: string(args),
+					},
+				}},
+			},
+			FinishReason: anyllm.FinishReasonToolCalls,
+		}},
+		Usage: &anyllm.Usage{PromptTokens: 10, CompletionTokens: 5},
+	}
 }
 
 // TextResponse returns a *ChatCompletion containing only assistant text and no tool calls.
