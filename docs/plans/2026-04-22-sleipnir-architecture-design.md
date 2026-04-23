@@ -420,6 +420,8 @@ Missing vars fall back to documented defaults. No file reads. No globals.
 Both `Config{}` (tests) and `LoadConfigFromEnv()` (production) are
 first-class.
 
+**Review Note:** Consider if `Middlewares` belongs in individual agent configuration rather than the main app config. Or maybe both, with agent config overriding the app config defaults?
+
 ---
 
 ## 13. Testing support (`sleipnirtest/`)
