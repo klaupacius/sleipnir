@@ -50,8 +50,8 @@ func (s *StubProvider) Completion(_ context.Context, params anyllm.CompletionPar
 	var lastUserContent string
 	for i := len(params.Messages) - 1; i >= 0; i-- {
 		if params.Messages[i].Role == anyllm.RoleUser {
-			if s, ok := params.Messages[i].Content.(string); ok {
-				lastUserContent = s
+			if text, ok := params.Messages[i].Content.(string); ok {
+				lastUserContent = text
 			}
 			break
 		}
