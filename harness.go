@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	anyllm "github.com/mozilla-ai/any-llm-go"
 )
@@ -190,6 +191,8 @@ func (h *Harness) runLoop(ctx context.Context, spec AgentSpec, in RunInput, pare
 		IsSubAgent: depth > 0,
 	}
 
+	mws := effectiveMiddlewares(h.cfg, spec)
+
 	allTools := make([]Tool, 0, len(spec.Tools)+len(in.ExtraTools))
 	allTools = append(allTools, spec.Tools...)
 	allTools = append(allTools, in.ExtraTools...)
@@ -240,7 +243,16 @@ func (h *Harness) runLoop(ctx context.Context, spec AgentSpec, in RunInput, pare
 			Model:    modelCfg,
 		}
 
-		resp, err := callProvider(ctx, req)
+		for _, mw := range mws {
+			if rw, ok := mw.(ContextRewriter); ok {
+				if err := rw.RewriteBeforeLLMCall(ctx, &req); err != nil {
+					emit(in.Events, ErrorEvent{AgentName: spec.Name, Err: err})
+					// proceed with req as-is
+				}
+			}
+		}
+
+		resp, err := h.callWithRetry(ctx, req, mws)
 		if err != nil {
 			return RunOutput{}, err
 		}
@@ -281,7 +293,7 @@ func (h *Harness) runLoop(ctx context.Context, spec AgentSpec, in RunInput, pare
 			return out, nil
 		}
 
-		toolResults := dispatchInParallel(ctx, resp.Message.ToolCalls, toolMap, spec.Name, depth, in, h, rs, in.Events, spec.MaxParallelTools)
+		toolResults := dispatchInParallel(ctx, resp.Message.ToolCalls, toolMap, agentInfo, in, h, rs, mws, in.Events, spec.MaxParallelTools)
 		for _, r := range toolResults {
 			localUsage.InputTokens += r.subUsage.InputTokens
 			localUsage.OutputTokens += r.subUsage.OutputTokens
@@ -305,11 +317,11 @@ func dispatchInParallel(
 	ctx context.Context,
 	calls []anyllm.ToolCall,
 	toolMap map[string]Tool,
-	agentName string,
-	depth int,
+	agent AgentInfo,
 	parentIn RunInput,
 	h *Harness,
 	rs *runState,
+	mws []Middleware,
 	sink Sink,
 	maxParallel int,
 ) []toolCallResult {
@@ -335,7 +347,7 @@ func dispatchInParallel(
 			defer func() { <-sem }()
 
 			emit(sink, ToolCallEvent{
-				AgentName:  agentName,
+				AgentName:  agent.Name,
 				ToolCallID: call.ID,
 				ToolName:   call.Function.Name,
 				Args:       json.RawMessage(call.Function.Arguments),
@@ -353,7 +365,7 @@ func dispatchInParallel(
 				if !specFound {
 					res = ToolResult{IsError: true, Content: "sub-agent not registered: " + sat.subAgentName()}
 				} else {
-					childOut, childErr := h.runLoop(ctx, childSpecRaw.(AgentSpec), childIn, agentName, depth+1, rs)
+					childOut, childErr := h.runLoop(ctx, childSpecRaw.(AgentSpec), childIn, agent.Name, agent.Depth+1, rs)
 					res, infraErr = subAgentResultToToolResult(childOut, childErr)
 					if childErr == nil || errors.Is(childErr, ErrIterationBudget) || errors.Is(childErr, ErrTokenBudget) {
 						subUsage = childOut.Usage
@@ -363,12 +375,24 @@ func dispatchInParallel(
 				res, infraErr = tool.Invoke(ctx, json.RawMessage(call.Function.Arguments))
 				if infraErr != nil {
 					res = ToolResult{IsError: true, Content: "tool execution failed: " + infraErr.Error()}
-					emit(sink, ErrorEvent{AgentName: agentName, Err: infraErr})
+					emit(sink, ErrorEvent{AgentName: agent.Name, Err: infraErr})
+				}
+			}
+
+			tc := &ToolCall{
+				Agent:      agent,
+				ToolCallID: call.ID,
+				ToolName:   call.Function.Name,
+				Args:       json.RawMessage(call.Function.Arguments),
+			}
+			for _, mw := range mws {
+				if obs, ok := mw.(ToolObserver); ok {
+					obs.OnToolCall(ctx, tc, &res, infraErr)
 				}
 			}
 
 			emit(sink, ToolResultEvent{
-				AgentName:  agentName,
+				AgentName:  agent.Name,
 				ToolCallID: call.ID,
 				Result:     res.Content,
 				IsError:    res.IsError,
@@ -433,7 +457,16 @@ func emit(sink Sink, e Event) {
 	}
 }
 
-func callProvider(ctx context.Context, req LLMRequest) (LLMResponse, error) {
+// effectiveMiddlewares returns the middleware chain for a given agent.
+// Non-nil AgentSpec.Middlewares (even empty) overrides Config.Middlewares entirely.
+func effectiveMiddlewares(cfg Config, spec AgentSpec) []Middleware {
+	if spec.Middlewares != nil {
+		return spec.Middlewares
+	}
+	return cfg.Middlewares
+}
+
+func (h *Harness) callProvider(ctx context.Context, req LLMRequest) (LLMResponse, error) {
 	if err := ctx.Err(); err != nil {
 		return LLMResponse{}, err
 	}
@@ -468,4 +501,47 @@ func callProvider(ctx context.Context, req LLMRequest) (LLMResponse, error) {
 		}
 	}
 	return LLMResponse{Agent: req.Agent, Message: msg, Usage: usage}, nil
+}
+
+func (h *Harness) callWithRetry(
+	ctx context.Context,
+	req LLMRequest,
+	mws []Middleware,
+) (LLMResponse, error) {
+	var (
+		resp LLMResponse
+		err  error
+	)
+	for attempt := 0; attempt <= h.cfg.MaxLLMRetries; attempt++ {
+		resp, err = h.callProvider(ctx, req)
+		if err == nil {
+			break
+		}
+		if attempt == h.cfg.MaxLLMRetries {
+			break
+		}
+		var shouldRetry bool
+		var backoff time.Duration
+		for _, mw := range mws {
+			if rp, ok := mw.(RetryPolicy); ok {
+				shouldRetry, backoff = rp.ShouldRetry(ctx, attempt, err)
+				break // first RetryPolicy wins
+			}
+		}
+		if !shouldRetry {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return LLMResponse{}, ctx.Err()
+		case <-time.After(backoff):
+		}
+	}
+	// Notify LLMObservers regardless of outcome.
+	for _, mw := range mws {
+		if obs, ok := mw.(LLMObserver); ok {
+			obs.OnLLMCall(ctx, &req, &resp, err)
+		}
+	}
+	return resp, err
 }
