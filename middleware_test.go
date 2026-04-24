@@ -292,8 +292,8 @@ func TestLLMObserverCalledOnError(t *testing.T) {
 	prov := &errorProvider{err: provErr}
 	obs := &captureLLMObserver{}
 
-	// MaxLLMRetries: 1 is non-zero so resolveDefaults won't override it.
-	// With no RetryPolicy in mws, the retry loop breaks immediately after 1 attempt.
+	// MaxLLMRetries: 1 means up to 2 total attempts (attempt 0 and attempt 1).
+	// With no RetryPolicy in the chain, the loop breaks on first failure (no retry).
 	h := mustNewHarness(t, sleipnir.Config{
 		MaxLLMRetries: 1,
 		Middlewares:   []sleipnir.Middleware{obs},
@@ -528,7 +528,7 @@ func TestEffectiveMiddlewaresAgentEmptyOverride(t *testing.T) {
 	}
 }
 
-// TestMultipleObserversAllCalled: two LLMObserver implementations in the chain; both called in order.
+// TestMultipleObserversAllCalled: two LLMObserver implementations in the chain; both are called.
 func TestMultipleObserversAllCalled(t *testing.T) {
 	stub := sleipnirtest.NewStubProvider(t, sleipnirtest.TextResponse("done"))
 	obsA := &captureLLMObserver{}

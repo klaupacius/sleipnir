@@ -37,6 +37,7 @@ type ToolObserver interface {
 // RetryPolicy decides whether a failed provider call should be retried and how
 // long to wait before the next attempt. The first RetryPolicy in the chain
 // wins; subsequent policies are not consulted.
+// attempt is 0-based: 0 on the first failure, 1 on the second, and so on.
 type RetryPolicy interface {
 	Middleware
 	ShouldRetry(ctx context.Context, attempt int, err error) (retry bool, backoff time.Duration)
@@ -44,6 +45,7 @@ type RetryPolicy interface {
 
 // ToolCall carries the agent identity and call parameters for ToolObserver.
 // Middleware must not mutate Agent fields.
+// ToolCall is distinct from [anyllm.ToolCall]; it carries harness-level agent identity.
 type ToolCall struct {
 	Agent      AgentInfo
 	ToolCallID string
