@@ -90,9 +90,9 @@ func AskUserTool(handler HITLHandler) Tool {
 }
 
 // TodoWriteTool returns a Tool that replaces the current todo list for the
-// invoking agent and emits a TodoEvent. The list is keyed by agent name, so
-// it persists across turns and is isolated between parallel sub-agents.
-// Pass via RunInput.ExtraTools.
+// invoking agent and emits a TodoEvent. The list is keyed by agent name:
+// state persists across turns, but two concurrent calls from the same agent
+// are not isolated from each other. Pass via RunInput.ExtraTools.
 func TodoWriteTool() Tool {
 	schema := map[string]any{
 		"type": "object",
