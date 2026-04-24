@@ -11,6 +11,31 @@ import (
 	anyllm "github.com/mozilla-ai/any-llm-go"
 )
 
+// subAgentTool is a marker interface for tools that represent sub-agents.
+// dispatchInParallel detects this interface to invoke runLoop recursively
+// instead of calling Invoke directly.
+type subAgentTool interface {
+	Tool
+	subAgentName() string
+}
+
+// agentAsToolImpl is the concrete type returned by AgentAsTool.
+// Its Invoke panics because the harness routes sub-agent calls through runLoop,
+// not through Invoke.
+type agentAsToolImpl struct {
+	def  ToolDefinition
+	name string
+}
+
+func (a *agentAsToolImpl) Definition() ToolDefinition { return a.def }
+func (a *agentAsToolImpl) subAgentName() string       { return a.name }
+func (a *agentAsToolImpl) Invoke(_ context.Context, _ json.RawMessage) (ToolResult, error) {
+	panic("sleipnir: agentAsToolImpl.Invoke called directly; use Harness.dispatchInParallel")
+}
+
+var _ Tool        = (*agentAsToolImpl)(nil)
+var _ subAgentTool = (*agentAsToolImpl)(nil)
+
 type RunInput struct {
 	AgentName                 string
 	Prompt                    string
@@ -121,6 +146,27 @@ func (h *Harness) RegisterAgent(spec AgentSpec) error {
 	return nil
 }
 
+// AgentAsTool returns a Tool that, when dispatched by the harness, recursively
+// runs the named sub-agent. The tool's Definition is derived from the
+// registered AgentSpec (Name, Description, InputSchema).
+//
+// Returns ErrAgentNotRegistered if no agent with that name has been registered.
+func (h *Harness) AgentAsTool(name string) (Tool, error) {
+	v, ok := h.agents.Load(name)
+	if !ok {
+		return nil, fmt.Errorf("%w: %q", ErrAgentNotRegistered, name)
+	}
+	spec := v.(AgentSpec)
+	return &agentAsToolImpl{
+		def: ToolDefinition{
+			Name:        spec.Name,
+			Description: spec.Description,
+			InputSchema: spec.InputSchema,
+		},
+		name: spec.Name,
+	}, nil
+}
+
 // Run the agent loop
 func (h *Harness) Run(ctx context.Context, in RunInput) (RunOutput, error) {
 	if !h.cfg.AllowLateRegistration {
@@ -132,11 +178,17 @@ func (h *Harness) Run(ctx context.Context, in RunInput) (RunOutput, error) {
 	}
 	spec := raw.(AgentSpec)
 
-	return h.runLoop(ctx, in, spec, AgentInfo{Name: spec.Name})
-
+	return h.runLoop(ctx, spec, in, "", 0)
 }
 
-func (h *Harness) runLoop(ctx context.Context, in RunInput, spec AgentSpec, info AgentInfo) (RunOutput, error) {
+func (h *Harness) runLoop(ctx context.Context, spec AgentSpec, in RunInput, parentName string, depth int) (RunOutput, error) {
+	agentInfo := AgentInfo{
+		Name:       spec.Name,
+		ParentName: parentName,
+		Depth:      depth,
+		IsSubAgent: depth > 0,
+	}
+
 	allTools := make([]Tool, 0, len(spec.Tools)+len(in.ExtraTools))
 	allTools = append(allTools, spec.Tools...)
 	allTools = append(allTools, in.ExtraTools...)
@@ -150,7 +202,7 @@ func (h *Harness) runLoop(ctx context.Context, in RunInput, spec AgentSpec, info
 		toolMap[t.Definition().Name] = t
 	}
 
-	emit(in.Events, AgentStartEvent{AgentName: spec.Name, ParentName: info.ParentName})
+	emit(in.Events, AgentStartEvent{AgentName: spec.Name, ParentName: parentName})
 
 	history := make([]anyllm.Message, 0, len(in.History)+8)
 
@@ -181,7 +233,7 @@ func (h *Harness) runLoop(ctx context.Context, in RunInput, spec AgentSpec, info
 		}
 
 		req := LLMRequest{
-			Agent:    info,
+			Agent:    agentInfo,
 			Messages: history,
 			Tools:    toolsToAnyllm(allTools),
 			Model:    modelCfg,
@@ -216,7 +268,7 @@ func (h *Harness) runLoop(ctx context.Context, in RunInput, spec AgentSpec, info
 			return out, nil
 		}
 
-		toolResults := dispatchInParallel(ctx, resp.Message.ToolCalls, toolMap, spec.Name, in.Events, spec.MaxParallelTools)
+		toolResults := dispatchInParallel(ctx, resp.Message.ToolCalls, toolMap, spec.Name, depth, in, h, in.Events, spec.MaxParallelTools)
 		history = append(history, toolResultMessages(toolResults)...)
 	}
 
@@ -235,6 +287,9 @@ func dispatchInParallel(
 	calls []anyllm.ToolCall,
 	toolMap map[string]Tool,
 	agentName string,
+	depth int,
+	parentIn RunInput,
+	h *Harness,
 	sink Sink,
 	maxParallel int,
 ) []toolCallResult {
@@ -271,6 +326,15 @@ func dispatchInParallel(
 			var infraErr error
 			if !ok {
 				res = ToolResult{IsError: true, Content: "unknown tool: " + call.Function.Name}
+			} else if sat, isSAT := tool.(subAgentTool); isSAT {
+				childIn := buildChildRunInput(parentIn, sat.subAgentName(), json.RawMessage(call.Function.Arguments))
+				childSpecRaw, specFound := h.agents.Load(sat.subAgentName())
+				if !specFound {
+					res = ToolResult{IsError: true, Content: "sub-agent not registered: " + sat.subAgentName()}
+				} else {
+					childOut, childErr := h.runLoop(ctx, childSpecRaw.(AgentSpec), childIn, agentName, depth+1)
+					res, infraErr = subAgentResultToToolResult(childOut, childErr)
+				}
 			} else {
 				res, infraErr = tool.Invoke(ctx, json.RawMessage(call.Function.Arguments))
 				if infraErr != nil {
@@ -290,6 +354,41 @@ func dispatchInParallel(
 	}
 	wg.Wait()
 	return results
+}
+
+// buildChildRunInput constructs a RunInput for a sub-agent call, inheriting
+// the parent's router, events, HITL, and (optionally) ExtraTools.
+func buildChildRunInput(parent RunInput, agentName string, args json.RawMessage) RunInput {
+	child := RunInput{
+		AgentName:                 agentName,
+		Input:                     args,
+		Router:                    parent.Router,
+		Events:                    parent.Events,
+		HITL:                      parent.HITL,
+		OmitExtraToolsInheritance: parent.OmitExtraToolsInheritance,
+	}
+	if !parent.OmitExtraToolsInheritance {
+		child.ExtraTools = parent.ExtraTools
+	}
+	return child
+}
+
+// subAgentResultToToolResult converts a runLoop result from a sub-agent into a
+// ToolResult for the parent's history. Budget errors are surfaced as
+// IsError=true (the parent can react). Context errors propagate as infraErr so
+// the parent run terminates.
+func subAgentResultToToolResult(out RunOutput, err error) (ToolResult, error) {
+	if err == nil {
+		return ToolResult{Content: out.Text}, nil
+	}
+	if errors.Is(err, ErrIterationBudget) || errors.Is(err, ErrTokenBudget) {
+		// Include the stop reason string so callers can identify the budget type.
+		return ToolResult{IsError: true, Content: string(out.Stopped) + ": " + err.Error()}, nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return ToolResult{}, err
+	}
+	return ToolResult{IsError: true, Content: "sub-agent failed: " + err.Error()}, nil
 }
 
 func toolResultMessages(results []toolCallResult) []anyllm.Message {

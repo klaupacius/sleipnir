@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 
@@ -758,5 +759,513 @@ func TestRunParallelRace(t *testing.T) {
 	}
 	if counter != 3 {
 		t.Errorf("expected counter=3, got %d", counter)
+	}
+}
+
+// --- Chunk 10: sub-agent tests ---
+
+// CaptureProvider wraps StubProvider and captures every CompletionParams it is called with.
+type CaptureProvider struct {
+	*sleipnirtest.StubProvider
+	mu     sync.Mutex
+	params []anyllm.CompletionParams
+}
+
+func newCaptureProvider(t *testing.T, responses ...*anyllm.ChatCompletion) *CaptureProvider {
+	return &CaptureProvider{StubProvider: sleipnirtest.NewStubProvider(t, responses...)}
+}
+
+func (c *CaptureProvider) Completion(ctx context.Context, p anyllm.CompletionParams) (*anyllm.ChatCompletion, error) {
+	c.mu.Lock()
+	c.params = append(c.params, p)
+	c.mu.Unlock()
+	return c.StubProvider.Completion(ctx, p)
+}
+
+func (c *CaptureProvider) CapturedParams() []anyllm.CompletionParams {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]anyllm.CompletionParams, len(c.params))
+	copy(out, c.params)
+	return out
+}
+
+// AgentAsTool on a registered agent -> no error; Definition matches spec
+func TestAgentAsToolRegistered(t *testing.T) {
+	h := mustNewHarness(t, sleipnir.Config{})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{
+		Name:        "child",
+		Description: "child agent",
+		MaxIterations: 5,
+	}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+
+	tool, err := h.AgentAsTool("child")
+	if err != nil {
+		t.Fatalf("AgentAsTool: %v", err)
+	}
+	if tool.Definition().Name != "child" {
+		t.Errorf("Definition().Name = %q, want %q", tool.Definition().Name, "child")
+	}
+	if tool.Definition().Description != "child agent" {
+		t.Errorf("Definition().Description = %q, want %q", tool.Definition().Description, "child agent")
+	}
+}
+
+// AgentAsTool on unknown name -> ErrAgentNotRegistered
+func TestAgentAsToolNotRegistered(t *testing.T) {
+	h := mustNewHarness(t, sleipnir.Config{})
+
+	_, err := h.AgentAsTool("unknown")
+	if !errors.Is(err, sleipnir.ErrAgentNotRegistered) {
+		t.Errorf("expected ErrAgentNotRegistered, got %v", err)
+	}
+}
+
+// Parent provider calls sub-agent tool; sub-agent returns text; parent receives ToolResultEvent
+// and continues to StopDone.
+func TestRunSubAgentBasic(t *testing.T) {
+	childStub := sleipnirtest.NewStubProvider(t, sleipnirtest.TextResponse("sub result"))
+	parentStub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("child", "tc-1", []byte(`{"input":"hi"}`)),
+		sleipnirtest.TextResponse("parent done"),
+	)
+
+	h := mustNewHarness(t, sleipnir.Config{AllowLateRegistration: true})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "child", MaxIterations: 5}); err != nil {
+		t.Fatalf("RegisterAgent child: %v", err)
+	}
+	childTool, err := h.AgentAsTool("child")
+	if err != nil {
+		t.Fatalf("AgentAsTool: %v", err)
+	}
+	if err := h.RegisterAgent(sleipnir.AgentSpec{
+		Name:          "parent",
+		MaxIterations: 5,
+		Tools:         []sleipnir.Tool{childTool},
+	}); err != nil {
+		t.Fatalf("RegisterAgent parent: %v", err)
+	}
+
+	router := sleipnir.MapRouter{
+		Overrides: map[string]sleipnir.ModelConfig{
+			"child":  {Provider: childStub, Model: "stub"},
+			"parent": {Provider: parentStub, Model: "stub"},
+		},
+	}
+	collector := sleipnirtest.NewEventCollector()
+
+	out, err := h.Run(context.Background(), sleipnir.RunInput{
+		AgentName: "parent",
+		Prompt:    "go",
+		Router:    router,
+		Events:    collector,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if out.Stopped != sleipnir.StopDone {
+		t.Errorf("expected StopDone, got %q", out.Stopped)
+	}
+
+	// The ToolResultEvent for the sub-agent call should have the sub-agent text.
+	results := sleipnirtest.ByType[sleipnir.ToolResultEvent](collector)
+	var parentResults []sleipnir.ToolResultEvent
+	for _, r := range results {
+		if r.AgentName == "parent" {
+			parentResults = append(parentResults, r)
+		}
+	}
+	if len(parentResults) != 1 {
+		t.Fatalf("expected 1 parent ToolResultEvent, got %d", len(parentResults))
+	}
+	if parentResults[0].Result != "sub result" {
+		t.Errorf("ToolResultEvent.Result = %q, want %q", parentResults[0].Result, "sub result")
+	}
+	if parentResults[0].IsError {
+		t.Error("expected IsError=false for successful sub-agent")
+	}
+}
+
+// Sub-agent AgentStartEvent.ParentName == parent name; sub-agent AgentEndEvent appears before
+// parent's ToolResultEvent for that call.
+func TestRunSubAgentEvents(t *testing.T) {
+	childStub := sleipnirtest.NewStubProvider(t, sleipnirtest.TextResponse("child text"))
+	parentStub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("child", "tc-1", []byte(`{}`)),
+		sleipnirtest.TextResponse("parent done"),
+	)
+
+	h := mustNewHarness(t, sleipnir.Config{AllowLateRegistration: true})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "child", MaxIterations: 5}); err != nil {
+		t.Fatalf("RegisterAgent child: %v", err)
+	}
+	childTool, _ := h.AgentAsTool("child")
+	if err := h.RegisterAgent(sleipnir.AgentSpec{
+		Name: "parent", MaxIterations: 5, Tools: []sleipnir.Tool{childTool},
+	}); err != nil {
+		t.Fatalf("RegisterAgent parent: %v", err)
+	}
+
+	router := sleipnir.MapRouter{
+		Overrides: map[string]sleipnir.ModelConfig{
+			"child":  {Provider: childStub, Model: "stub"},
+			"parent": {Provider: parentStub, Model: "stub"},
+		},
+	}
+	collector := sleipnirtest.NewEventCollector()
+
+	if _, err := h.Run(context.Background(), sleipnir.RunInput{
+		AgentName: "parent", Router: router, Events: collector,
+	}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Verify sub-agent AgentStartEvent has ParentName == "parent"
+	starts := sleipnirtest.ByType[sleipnir.AgentStartEvent](collector)
+	var childStart *sleipnir.AgentStartEvent
+	for i := range starts {
+		if starts[i].AgentName == "child" {
+			childStart = &starts[i]
+			break
+		}
+	}
+	if childStart == nil {
+		t.Fatal("no AgentStartEvent for child")
+	}
+	if childStart.ParentName != "parent" {
+		t.Errorf("child AgentStartEvent.ParentName = %q, want %q", childStart.ParentName, "parent")
+	}
+
+	// Verify ordering: child AgentEndEvent appears before parent ToolResultEvent
+	allEvents := collector.Events()
+	childEndIdx := -1
+	parentResultIdx := -1
+	for i, e := range allEvents {
+		if end, ok := e.(sleipnir.AgentEndEvent); ok && end.AgentName == "child" {
+			childEndIdx = i
+		}
+		if res, ok := e.(sleipnir.ToolResultEvent); ok && res.AgentName == "parent" {
+			parentResultIdx = i
+		}
+	}
+	if childEndIdx == -1 {
+		t.Fatal("no child AgentEndEvent found")
+	}
+	if parentResultIdx == -1 {
+		t.Fatal("no parent ToolResultEvent found")
+	}
+	if childEndIdx >= parentResultIdx {
+		t.Errorf("expected child AgentEndEvent (idx %d) before parent ToolResultEvent (idx %d)", childEndIdx, parentResultIdx)
+	}
+}
+
+// Sub-agent's provider receives only its own messages — not the parent's history.
+func TestRunSubAgentIsolatedHistory(t *testing.T) {
+	childCapture := newCaptureProvider(t, sleipnirtest.TextResponse("child result"))
+	parentStub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("child", "tc-1", []byte(`{"q":"hello"}`)),
+		sleipnirtest.TextResponse("parent done"),
+	)
+
+	h := mustNewHarness(t, sleipnir.Config{AllowLateRegistration: true})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "child", MaxIterations: 5}); err != nil {
+		t.Fatalf("RegisterAgent child: %v", err)
+	}
+	childTool, _ := h.AgentAsTool("child")
+	if err := h.RegisterAgent(sleipnir.AgentSpec{
+		Name: "parent", MaxIterations: 5, Tools: []sleipnir.Tool{childTool},
+	}); err != nil {
+		t.Fatalf("RegisterAgent parent: %v", err)
+	}
+
+	router := sleipnir.MapRouter{
+		Overrides: map[string]sleipnir.ModelConfig{
+			"child":  {Provider: childCapture, Model: "stub"},
+			"parent": {Provider: parentStub, Model: "stub"},
+		},
+	}
+
+	if _, err := h.Run(context.Background(), sleipnir.RunInput{
+		AgentName: "parent",
+		Prompt:    "parent prompt that should not appear in child history",
+		Router:    router,
+	}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	captured := childCapture.CapturedParams()
+	if len(captured) != 1 {
+		t.Fatalf("expected child provider called once, got %d", len(captured))
+	}
+	for _, msg := range captured[0].Messages {
+		if msg.Role == anyllm.RoleUser {
+			if s, ok := msg.Content.(string); ok && strings.Contains(s, "parent prompt") {
+				t.Error("child received parent's prompt in its history")
+			}
+		}
+	}
+}
+
+// ExtraTools inherited by sub-agent (OmitExtraToolsInheritance: false).
+func TestRunSubAgentExtraToolsInherited(t *testing.T) {
+	extraInvoked := make(chan struct{}, 1)
+	extraTool := sleipnirtest.NewStubTool("extra", "", nil, func(_ context.Context, _ json.RawMessage) (sleipnir.ToolResult, error) {
+		select {
+		case extraInvoked <- struct{}{}:
+		default:
+		}
+		return sleipnir.ToolResult{Content: "extra result"}, nil
+	})
+
+	// child: calls extra tool, then returns text
+	childStub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("extra", "ec-1", []byte(`{}`)),
+		sleipnirtest.TextResponse("child done"),
+	)
+	// parent: calls child sub-agent, then returns text
+	parentStub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("child", "tc-1", []byte(`{}`)),
+		sleipnirtest.TextResponse("parent done"),
+	)
+
+	h := mustNewHarness(t, sleipnir.Config{AllowLateRegistration: true})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "child", MaxIterations: 5}); err != nil {
+		t.Fatalf("RegisterAgent child: %v", err)
+	}
+	childTool, _ := h.AgentAsTool("child")
+	if err := h.RegisterAgent(sleipnir.AgentSpec{
+		Name: "parent", MaxIterations: 5, Tools: []sleipnir.Tool{childTool},
+	}); err != nil {
+		t.Fatalf("RegisterAgent parent: %v", err)
+	}
+
+	router := sleipnir.MapRouter{
+		Overrides: map[string]sleipnir.ModelConfig{
+			"child":  {Provider: childStub, Model: "stub"},
+			"parent": {Provider: parentStub, Model: "stub"},
+		},
+	}
+
+	if _, err := h.Run(context.Background(), sleipnir.RunInput{
+		AgentName:                 "parent",
+		Router:                    router,
+		ExtraTools:                []sleipnir.Tool{extraTool},
+		OmitExtraToolsInheritance: false,
+	}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	select {
+	case <-extraInvoked:
+		// good
+	default:
+		t.Error("expected extra tool to be invoked by child, but it was not")
+	}
+}
+
+// ExtraTools NOT inherited when OmitExtraToolsInheritance: true.
+func TestRunSubAgentExtraToolsNotInherited(t *testing.T) {
+	extraTool := sleipnirtest.NewStubTool("extra", "", nil, func(_ context.Context, _ json.RawMessage) (sleipnir.ToolResult, error) {
+		return sleipnir.ToolResult{Content: "extra result"}, nil
+	})
+
+	// child: tries to call extra tool (unknown), then returns text
+	childStub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("extra", "ec-1", []byte(`{}`)),
+		sleipnirtest.TextResponse("child done"),
+	)
+	parentStub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("child", "tc-1", []byte(`{}`)),
+		sleipnirtest.TextResponse("parent done"),
+	)
+
+	h := mustNewHarness(t, sleipnir.Config{AllowLateRegistration: true})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "child", MaxIterations: 5}); err != nil {
+		t.Fatalf("RegisterAgent child: %v", err)
+	}
+	childTool, _ := h.AgentAsTool("child")
+	if err := h.RegisterAgent(sleipnir.AgentSpec{
+		Name: "parent", MaxIterations: 5, Tools: []sleipnir.Tool{childTool},
+	}); err != nil {
+		t.Fatalf("RegisterAgent parent: %v", err)
+	}
+
+	router := sleipnir.MapRouter{
+		Overrides: map[string]sleipnir.ModelConfig{
+			"child":  {Provider: childStub, Model: "stub"},
+			"parent": {Provider: parentStub, Model: "stub"},
+		},
+	}
+	collector := sleipnirtest.NewEventCollector()
+
+	out, err := h.Run(context.Background(), sleipnir.RunInput{
+		AgentName:                 "parent",
+		Router:                    router,
+		ExtraTools:                []sleipnir.Tool{extraTool},
+		OmitExtraToolsInheritance: true,
+		Events:                    collector,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if out.Stopped != sleipnir.StopDone {
+		t.Errorf("expected parent StopDone, got %q", out.Stopped)
+	}
+
+	// The child should have received an unknown-tool error for "extra"
+	childResults := sleipnirtest.ByType[sleipnir.ToolResultEvent](collector)
+	var childUnknown bool
+	for _, r := range childResults {
+		if r.AgentName == "child" && r.IsError {
+			childUnknown = true
+		}
+	}
+	if !childUnknown {
+		t.Error("expected child to receive IsError=true for unknown 'extra' tool")
+	}
+	// extra tool should NOT have been invoked
+	if extraTool.InvokeCount() != 0 {
+		t.Errorf("extra tool should not be invoked, got %d", extraTool.InvokeCount())
+	}
+}
+
+// Sub-agent hitting MaxIterations -> ErrIterationBudget; parent receives ToolResultEvent{IsError: true};
+// parent run continues.
+func TestRunSubAgentIterationBudget(t *testing.T) {
+	// Child always returns a tool call (never text), MaxIterations=1 -> hits ErrIterationBudget
+	// The child's "loop" tool just returns something, but the child will try to call it once
+	// and then exhaust its budget.
+	childLoopTool := sleipnirtest.NewStubTool("loop", "", nil, func(_ context.Context, _ json.RawMessage) (sleipnir.ToolResult, error) {
+		return sleipnir.ToolResult{Content: "looping"}, nil
+	})
+	// child always responds with a tool call
+	childStub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("loop", "lc-1", []byte(`{}`)),
+		// no text response — budget exhausted after 1 iteration
+	)
+	parentStub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("child", "tc-1", []byte(`{}`)),
+		sleipnirtest.TextResponse("parent done after child budget error"),
+	)
+
+	h := mustNewHarness(t, sleipnir.Config{AllowLateRegistration: true})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{
+		Name:          "child",
+		MaxIterations: 1, // hits budget immediately after one tool call
+		Tools:         []sleipnir.Tool{childLoopTool},
+	}); err != nil {
+		t.Fatalf("RegisterAgent child: %v", err)
+	}
+	childTool, _ := h.AgentAsTool("child")
+	if err := h.RegisterAgent(sleipnir.AgentSpec{
+		Name:          "parent",
+		MaxIterations: 5,
+		Tools:         []sleipnir.Tool{childTool},
+	}); err != nil {
+		t.Fatalf("RegisterAgent parent: %v", err)
+	}
+
+	router := sleipnir.MapRouter{
+		Overrides: map[string]sleipnir.ModelConfig{
+			"child":  {Provider: childStub, Model: "stub"},
+			"parent": {Provider: parentStub, Model: "stub"},
+		},
+	}
+	collector := sleipnirtest.NewEventCollector()
+
+	out, err := h.Run(context.Background(), sleipnir.RunInput{
+		AgentName: "parent",
+		Router:    router,
+		Events:    collector,
+	})
+	if err != nil {
+		t.Fatalf("parent Run should succeed, got %v", err)
+	}
+	if out.Stopped != sleipnir.StopDone {
+		t.Errorf("expected parent StopDone, got %q", out.Stopped)
+	}
+
+	// Parent should have received an IsError ToolResultEvent for the child sub-agent call
+	results := sleipnirtest.ByType[sleipnir.ToolResultEvent](collector)
+	var parentChildResult *sleipnir.ToolResultEvent
+	for i := range results {
+		if results[i].AgentName == "parent" && results[i].ToolCallID == "tc-1" {
+			parentChildResult = &results[i]
+		}
+	}
+	if parentChildResult == nil {
+		t.Fatal("no parent ToolResultEvent for child sub-agent call")
+	}
+	if !parentChildResult.IsError {
+		t.Error("expected IsError=true for child hitting iteration budget")
+	}
+	if !strings.Contains(parentChildResult.Result, "iteration_budget") {
+		t.Errorf("expected result to contain 'iteration_budget', got %q", parentChildResult.Result)
+	}
+}
+
+// Cancel ctx while sub-agent is mid-run -> parent run terminates with context.Canceled.
+func TestRunSubAgentContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	childStarted := make(chan struct{})
+	childRelease := make(chan struct{})
+
+	// A blocking tool inside the child: signals childStarted and blocks on childRelease.
+	blockingTool := sleipnirtest.NewStubTool("block", "", nil, func(_ context.Context, _ json.RawMessage) (sleipnir.ToolResult, error) {
+		close(childStarted)
+		<-childRelease
+		return sleipnir.ToolResult{Content: "unblocked"}, nil
+	})
+
+	childStub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("block", "bc-1", []byte(`{}`)),
+		// no second response needed: context will be cancelled
+	)
+	parentStub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("child", "tc-1", []byte(`{}`)),
+	)
+
+	h := mustNewHarness(t, sleipnir.Config{AllowLateRegistration: true})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{
+		Name:          "child",
+		MaxIterations: 5,
+		Tools:         []sleipnir.Tool{blockingTool},
+	}); err != nil {
+		t.Fatalf("RegisterAgent child: %v", err)
+	}
+	childTool, _ := h.AgentAsTool("child")
+	if err := h.RegisterAgent(sleipnir.AgentSpec{
+		Name:          "parent",
+		MaxIterations: 5,
+		Tools:         []sleipnir.Tool{childTool},
+	}); err != nil {
+		t.Fatalf("RegisterAgent parent: %v", err)
+	}
+
+	router := sleipnir.MapRouter{
+		Overrides: map[string]sleipnir.ModelConfig{
+			"child":  {Provider: childStub, Model: "stub"},
+			"parent": {Provider: parentStub, Model: "stub"},
+		},
+	}
+
+	runDone := make(chan error, 1)
+	go func() {
+		_, err := h.Run(ctx, sleipnir.RunInput{AgentName: "parent", Router: router})
+		runDone <- err
+	}()
+
+	// Wait until child's blocking tool is running, then cancel context.
+	<-childStarted
+	cancel()
+	close(childRelease) // unblock the tool so goroutines can clean up
+
+	err := <-runDone
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled, got %v", err)
 	}
 }
