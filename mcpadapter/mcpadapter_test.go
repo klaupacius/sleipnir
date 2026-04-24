@@ -6,6 +6,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"sleipnir.dev/sleipnir/mcpadapter"
 	"sleipnir.dev/sleipnir/sleipnirtest"
 )
@@ -139,5 +140,66 @@ func TestLoadToolsSnapshot(t *testing.T) {
 	// the snapshot count remains stable — no refresh happened.)
 	if len(tools) != 1 {
 		t.Errorf("snapshot grew unexpectedly: got %d tools", len(tools))
+	}
+}
+
+// TestLoadToolsMultipleTextContent verifies that when a tool returns multiple
+// TextContent items, the adapter concatenates all of them into a single string.
+func TestLoadToolsMultipleTextContent(t *testing.T) {
+	srv := sleipnirtest.NewFakeMCPServer(t)
+	srv.AddRawTool("multi", "multiple text items", func(_ context.Context, _ map[string]any) (*mcp.CallToolResult, error) {
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: "hello"},
+				&mcp.TextContent{Text: " world"},
+			},
+		}, nil
+	})
+	srv.Start()
+
+	tools, err := mcpadapter.LoadTools(context.Background(), srv.Client())
+	if err != nil {
+		t.Fatalf("LoadTools: %v", err)
+	}
+	if len(tools) != 1 {
+		t.Fatalf("expected 1 tool, got %d", len(tools))
+	}
+
+	result, err := tools[0].Invoke(context.Background(), json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if result.Content != "hello world" {
+		t.Errorf("content: got %q, want %q", result.Content, "hello world")
+	}
+}
+
+// TestLoadToolsNonTextContent verifies that non-text content items produce a
+// non-empty fallback string instead of silently returning empty.
+func TestLoadToolsNonTextContent(t *testing.T) {
+	srv := sleipnirtest.NewFakeMCPServer(t)
+	srv.AddRawTool("img", "returns image content", func(_ context.Context, _ map[string]any) (*mcp.CallToolResult, error) {
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.ImageContent{MIMEType: "image/png", Data: []byte("fake")},
+			},
+		}, nil
+	})
+	srv.Start()
+
+	tools, err := mcpadapter.LoadTools(context.Background(), srv.Client())
+	if err != nil {
+		t.Fatalf("LoadTools: %v", err)
+	}
+	if len(tools) != 1 {
+		t.Fatalf("expected 1 tool, got %d", len(tools))
+	}
+
+	result, err := tools[0].Invoke(context.Background(), json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if result.Content == "" {
+		t.Error("expected non-empty fallback content for non-text result, got empty string")
 	}
 }

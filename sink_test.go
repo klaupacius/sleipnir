@@ -128,6 +128,18 @@ func TestBufferedSinkConcurrentSend(t *testing.T) {
 	}()
 }
 
+// TestBufferedSinkSendAfterClose verifies that Send does not panic when the
+// context is cancelled and the channel has been closed.
+func TestBufferedSinkSendAfterClose(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	sink := NewBufferedSink(ctx, 10)
+	cancel()
+	// Wait for the close goroutine to close the channel.
+	time.Sleep(20 * time.Millisecond)
+	// Must not panic:
+	sink.Send(TokenEvent{})
+}
+
 func TestBufferedSinkContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	size := 10 // size >= N to ensure no dropped events

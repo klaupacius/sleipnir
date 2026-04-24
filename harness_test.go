@@ -82,6 +82,25 @@ func TestRegisterAgentToolCollision(t *testing.T) {
 	}
 }
 
+// Spec with duplicate tool names -> error message contains the colliding tool name
+func TestRegisterAgentToolCollisionIncludesToolName(t *testing.T) {
+	h := mustNewHarness(t, sleipnir.Config{})
+	const toolName = "my_special_xyz_tool"
+	err := h.RegisterAgent(sleipnir.AgentSpec{
+		Name:  "agent",
+		Tools: []sleipnir.Tool{sleipnirtest.StaticTool(toolName, ""), sleipnirtest.StaticTool(toolName, "")},
+	})
+	if err == nil {
+		t.Fatal("expected error for duplicate tool, got nil")
+	}
+	if !errors.Is(err, sleipnir.ErrToolNameCollision) {
+		t.Fatalf("expected ErrToolNameCollision, got %v", err)
+	}
+	if !strings.Contains(err.Error(), toolName) {
+		t.Errorf("error message should contain the duplicate tool name %q, got: %q", toolName, err.Error())
+	}
+}
+
 // Unknown agent name -> ErrAgentNotRegistered
 func TestRunUnknownAgent(t *testing.T) {
 	h := mustNewHarness(t, sleipnir.Config{})

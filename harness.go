@@ -79,11 +79,13 @@ type Usage struct {
 type StopReason string
 
 const (
-	StopDone            StopReason = "done"
-	StopIterationBudget StopReason = "iteration_budget"
-	StopTokenBudget     StopReason = "token_budget"
-	StopHITLTimeout     StopReason = "hitl_timeout"
-	StopHITLCancelled   StopReason = "hitl_cancelled"
+	StopDone             StopReason = "done"
+	StopIterationBudget  StopReason = "iteration_budget"
+	StopTokenBudget      StopReason = "token_budget"
+	StopHITLTimeout      StopReason = "hitl_timeout"
+	StopHITLCancelled    StopReason = "hitl_cancelled"
+	StopContextCancelled StopReason = "context_cancelled"
+	StopContextTimeout   StopReason = "context_timeout"
 )
 
 // LLMRequest is the request passed to the LLM. Middleware may mutate fields.
@@ -140,7 +142,7 @@ func (h *Harness) RegisterAgent(spec AgentSpec) error {
 
 	// Validate tool names
 	if e := validateToolNames(spec.Tools); e != nil {
-		return ErrToolNameCollision
+		return e
 	}
 
 	// Resolve zeros in agent config -- the stored spec must contain no zeros
@@ -271,6 +273,7 @@ func (h *Harness) runLoop(ctx context.Context, spec AgentSpec, in RunInput, pare
 				}
 			}
 		}
+		history = req.Messages
 
 		resp, err := h.callWithRetry(ctx, req, mws)
 		if err != nil {
@@ -505,6 +508,10 @@ func stopReasonForErr(err error) StopReason {
 		return StopHITLTimeout
 	case errors.Is(err, ErrHITLCancelled):
 		return StopHITLCancelled
+	case errors.Is(err, context.DeadlineExceeded):
+		return StopContextTimeout
+	case errors.Is(err, context.Canceled):
+		return StopContextCancelled
 	default:
 		return StopDone
 	}

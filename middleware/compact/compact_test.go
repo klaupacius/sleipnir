@@ -226,6 +226,36 @@ func TestCompactorSummarizerError(t *testing.T) {
 	}
 }
 
+// TestCompactorSummarizerErrorWrapsErrCompactionFailed verifies that the error
+// returned when summarization fails wraps the exported ErrCompactionFailed sentinel,
+// allowing callers to use errors.Is to detect compaction failures.
+func TestCompactorSummarizerErrorWrapsErrCompactionFailed(t *testing.T) {
+	sentinel := errors.New("summarizer down")
+	c := compact.NewCompactor(compact.Config{
+		Provider:      &errProvider{err: sentinel},
+		Model:         "stub",
+		Threshold:     0.75,
+		ContextWindow: 1000,
+	})
+
+	msgs := bigMessages(4, 800)
+	req := agentReq("agent", false, msgs)
+
+	cs := newSimpleStore()
+	ctx := withStore(context.Background(), cs)
+
+	err := c.RewriteBeforeLLMCall(ctx, req)
+	if err == nil {
+		t.Fatal("expected error from failing summarizer, got nil")
+	}
+	if !errors.Is(err, sleipnir.ErrCompactionFailed) {
+		t.Fatalf("expected error to wrap ErrCompactionFailed; got: %v", err)
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected error to also wrap original sentinel; got: %v", err)
+	}
+}
+
 // TestCompactorNoStoreInCtx verifies that a context without a CompactStore
 // causes no panic and returns nil.
 func TestCompactorNoStoreInCtx(t *testing.T) {
