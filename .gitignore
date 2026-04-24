@@ -37,3 +37,6 @@ Thumbs.db
 # Ephemeral progress notes
 PROGRESS.md
 
+# Git worktrees
+.worktrees/
+
