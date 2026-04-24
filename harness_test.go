@@ -2112,3 +2112,54 @@ func TestTodoReadEmptyList(t *testing.T) {
 		t.Error("no ToolResultEvent for todo_read r1")
 	}
 }
+
+// TestRunSubAgentInputPassthrough verifies that tool-call arguments sent to a
+// sub-agent are available as AgentInput.Input in its SystemPrompt function.
+func TestRunSubAgentInputPassthrough(t *testing.T) {
+	var capturedInput json.RawMessage
+
+	childStub := sleipnirtest.NewStubProvider(t, sleipnirtest.TextResponse("done"))
+	parentStub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("child", "tc-1", []byte(`{"task":"write report"}`)),
+		sleipnirtest.TextResponse("parent done"),
+	)
+
+	h := mustNewHarness(t, sleipnir.Config{AllowLateRegistration: true})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{
+		Name:          "child",
+		MaxIterations: 5,
+		SystemPrompt: func(in sleipnir.AgentInput) string {
+			capturedInput = in.Input
+			return "child"
+		},
+	}); err != nil {
+		t.Fatalf("RegisterAgent child: %v", err)
+	}
+	childTool, _ := h.AgentAsTool("child")
+	if err := h.RegisterAgent(sleipnir.AgentSpec{
+		Name:          "parent",
+		MaxIterations: 5,
+		Tools:         []sleipnir.Tool{childTool},
+	}); err != nil {
+		t.Fatalf("RegisterAgent parent: %v", err)
+	}
+
+	router := sleipnir.MapRouter{
+		Overrides: map[string]sleipnir.ModelConfig{
+			"child":  {Provider: childStub, Model: "stub"},
+			"parent": {Provider: parentStub, Model: "stub"},
+		},
+	}
+	if _, err := h.Run(context.Background(), sleipnir.RunInput{
+		AgentName: "parent",
+		Prompt:    "go",
+		Router:    router,
+	}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	want := `{"task":"write report"}`
+	if string(capturedInput) != want {
+		t.Errorf("AgentInput.Input = %q, want %q", string(capturedInput), want)
+	}
+}

@@ -227,7 +227,11 @@ func (h *Harness) runLoop(ctx context.Context, spec AgentSpec, in RunInput, pare
 	history := make([]anyllm.Message, 0, len(in.History)+8)
 
 	if sp := spec.SystemPrompt; sp != nil {
-		ai := AgentInput{Prompt: in.Prompt, History: in.History}
+		var inputBytes json.RawMessage
+		if raw, ok := in.Input.(json.RawMessage); ok {
+			inputBytes = raw
+		}
+		ai := AgentInput{Prompt: in.Prompt, Input: inputBytes, History: in.History}
 		history = append(history, anyllm.Message{
 			Role:    anyllm.RoleSystem,
 			Content: sp(ai),
