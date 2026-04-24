@@ -18,6 +18,7 @@ type (
 	agentNameCtxKey   struct{}
 	toolCallIDCtxKey  struct{}
 	hitlTimeoutCtxKey struct{}
+	runStateCtxKey    struct{}
 )
 
 // subAgentTool is a marker interface for tools that represent sub-agents.
@@ -197,6 +198,7 @@ func (h *Harness) runLoop(ctx context.Context, spec AgentSpec, in RunInput, pare
 	ctx = context.WithValue(ctx, agentNameCtxKey{}, spec.Name)
 	ctx = context.WithValue(ctx, hitlTimeoutCtxKey{}, h.cfg.HITLTimeout)
 	ctx = context.WithValue(ctx, toolCallIDCtxKey{}, "__root__")
+	ctx = context.WithValue(ctx, runStateCtxKey{}, rs)
 
 	agentInfo := AgentInfo{
 		Name:       spec.Name,

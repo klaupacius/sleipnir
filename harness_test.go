@@ -1818,3 +1818,297 @@ func TestAskUserToolParallel(t *testing.T) {
 		t.Errorf("max concurrent handlers = %d, want >= 2", maxSeen)
 	}
 }
+
+// --- Chunk 16: todo tool tests ---
+
+// TestTodoWriteAndRead: LLM calls todo_write then todo_read; read result contains the written task.
+func TestTodoWriteAndRead(t *testing.T) {
+	stub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("todo_write", "call1", []byte(`{"tasks":[{"id":"1","text":"buy milk","status":"pending"}]}`)),
+		sleipnirtest.ToolCallResponse("todo_read", "call2", []byte(`{}`)),
+		sleipnirtest.TextResponse("done"),
+	)
+	h := mustNewHarness(t, sleipnir.Config{})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "agent", MaxIterations: 5}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+
+	writeTool := sleipnir.TodoWriteTool()
+	readTool := sleipnir.TodoReadTool()
+	collector := sleipnirtest.NewEventCollector()
+
+	_, err := h.Run(context.Background(), sleipnir.RunInput{
+		AgentName:  "agent",
+		Prompt:     "go",
+		Router:     defaultRouter(stub),
+		ExtraTools: []sleipnir.Tool{writeTool, readTool},
+		Events:     collector,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Verify the ToolResultEvent for todo_read contains the task written by todo_write.
+	results := sleipnirtest.ByType[sleipnir.ToolResultEvent](collector)
+	var readResultContent string
+	for _, r := range results {
+		if r.ToolCallID == "call2" {
+			readResultContent = r.Result
+		}
+	}
+	if !strings.Contains(readResultContent, "buy milk") {
+		t.Errorf("todo_read result %q does not contain written task %q", readResultContent, "buy milk")
+	}
+}
+
+// TestTodoWriteEmitsTodoEvent: todo_write emits a TodoEvent with correct contents.
+func TestTodoWriteEmitsTodoEvent(t *testing.T) {
+	stub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("todo_write", "call1", []byte(`{"tasks":[{"id":"42","text":"clean house","status":"in_progress"}]}`)),
+		sleipnirtest.TextResponse("done"),
+	)
+	h := mustNewHarness(t, sleipnir.Config{})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "agent", MaxIterations: 5}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+
+	collector := sleipnirtest.NewEventCollector()
+	_, err := h.Run(context.Background(), sleipnir.RunInput{
+		AgentName:  "agent",
+		Prompt:     "go",
+		Router:     defaultRouter(stub),
+		ExtraTools: []sleipnir.Tool{sleipnir.TodoWriteTool()},
+		Events:     collector,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	todoEvents := sleipnirtest.ByType[sleipnir.TodoEvent](collector)
+	if len(todoEvents) != 1 {
+		t.Fatalf("expected 1 TodoEvent, got %d", len(todoEvents))
+	}
+	ev := todoEvents[0]
+	if ev.AgentName != "agent" {
+		t.Errorf("TodoEvent.AgentName = %q, want %q", ev.AgentName, "agent")
+	}
+	if ev.ToolCallID != "call1" {
+		t.Errorf("TodoEvent.ToolCallID = %q, want %q", ev.ToolCallID, "call1")
+	}
+	if len(ev.Todos) != 1 || ev.Todos[0].ID != "42" || ev.Todos[0].Text != "clean house" {
+		t.Errorf("TodoEvent.Todos = %v, want [{42 clean house in_progress}]", ev.Todos)
+	}
+}
+
+// TestTodoWriteFullReplace: second todo_write replaces the first list entirely.
+func TestTodoWriteFullReplace(t *testing.T) {
+	stub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("todo_write", "call1", []byte(`{"tasks":[{"id":"1","text":"first","status":"pending"}]}`)),
+		sleipnirtest.ToolCallResponse("todo_write", "call2", []byte(`{"tasks":[{"id":"2","text":"second","status":"done"},{"id":"3","text":"third","status":"pending"}]}`)),
+		sleipnirtest.ToolCallResponse("todo_read", "call3", []byte(`{}`)),
+		sleipnirtest.TextResponse("done"),
+	)
+	h := mustNewHarness(t, sleipnir.Config{})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "agent", MaxIterations: 10}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+
+	collector := sleipnirtest.NewEventCollector()
+	_, err := h.Run(context.Background(), sleipnir.RunInput{
+		AgentName:  "agent",
+		Prompt:     "go",
+		Router:     defaultRouter(stub),
+		ExtraTools: []sleipnir.Tool{sleipnir.TodoWriteTool(), sleipnir.TodoReadTool()},
+		Events:     collector,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// The read after second write should not contain "first".
+	results := sleipnirtest.ByType[sleipnir.ToolResultEvent](collector)
+	var readContent string
+	for _, r := range results {
+		if r.ToolCallID == "call3" {
+			readContent = r.Result
+		}
+	}
+	if strings.Contains(readContent, "first") {
+		t.Errorf("todo_read after second write still contains %q (not replaced): %s", "first", readContent)
+	}
+	if !strings.Contains(readContent, "second") {
+		t.Errorf("todo_read after second write missing %q: %s", "second", readContent)
+	}
+	if !strings.Contains(readContent, "third") {
+		t.Errorf("todo_read after second write missing %q: %s", "third", readContent)
+	}
+}
+
+// TestTodoPersistsAcrossTurns: write in turn 1, read in turn 3 → same tasks returned.
+func TestTodoPersistsAcrossTurns(t *testing.T) {
+	stub := sleipnirtest.NewStubProvider(t,
+		// turn 1: write
+		sleipnirtest.ToolCallResponse("todo_write", "w1", []byte(`{"tasks":[{"id":"99","text":"persistent","status":"pending"}]}`)),
+		// turn 2: no-op tool call
+		sleipnirtest.ToolCallResponse("todo_read", "r1", []byte(`{}`)),
+		// turn 3: read again
+		sleipnirtest.ToolCallResponse("todo_read", "r2", []byte(`{}`)),
+		sleipnirtest.TextResponse("done"),
+	)
+	h := mustNewHarness(t, sleipnir.Config{})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "agent", MaxIterations: 10}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+
+	collector := sleipnirtest.NewEventCollector()
+	_, err := h.Run(context.Background(), sleipnir.RunInput{
+		AgentName:  "agent",
+		Prompt:     "go",
+		Router:     defaultRouter(stub),
+		ExtraTools: []sleipnir.Tool{sleipnir.TodoWriteTool(), sleipnir.TodoReadTool()},
+		Events:     collector,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Both reads should return the written task.
+	results := sleipnirtest.ByType[sleipnir.ToolResultEvent](collector)
+	for _, callID := range []string{"r1", "r2"} {
+		var found bool
+		for _, r := range results {
+			if r.ToolCallID == callID {
+				found = true
+				if !strings.Contains(r.Result, "persistent") {
+					t.Errorf("todo_read %s result %q does not contain written task", callID, r.Result)
+				}
+			}
+		}
+		if !found {
+			t.Errorf("no ToolResultEvent for todo_read callID %q", callID)
+		}
+	}
+}
+
+// TestTodoIsolatedByAgentName: two parallel sub-agents with different names each
+// write different todos; each sub-agent's todo_read returns only its own tasks.
+func TestTodoIsolatedByAgentName(t *testing.T) {
+	childAStub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("todo_write", "aw1", []byte(`{"tasks":[{"id":"a1","text":"agent-a task","status":"pending"}]}`)),
+		sleipnirtest.ToolCallResponse("todo_read", "ar1", []byte(`{}`)),
+		sleipnirtest.TextResponse("a done"),
+	)
+	childBStub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("todo_write", "bw1", []byte(`{"tasks":[{"id":"b1","text":"agent-b task","status":"pending"}]}`)),
+		sleipnirtest.ToolCallResponse("todo_read", "br1", []byte(`{}`)),
+		sleipnirtest.TextResponse("b done"),
+	)
+	parentStub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.MultiToolCallResponse(
+			anyllm.ToolCall{ID: "pa", Function: anyllm.FunctionCall{Name: "child-a", Arguments: `{"input":"go"}`}},
+			anyllm.ToolCall{ID: "pb", Function: anyllm.FunctionCall{Name: "child-b", Arguments: `{"input":"go"}`}},
+		),
+		sleipnirtest.TextResponse("parent done"),
+	)
+
+	h := mustNewHarness(t, sleipnir.Config{AllowLateRegistration: true})
+	extraTools := []sleipnir.Tool{sleipnir.TodoWriteTool(), sleipnir.TodoReadTool()}
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "child-a", MaxIterations: 5, Tools: extraTools}); err != nil {
+		t.Fatalf("RegisterAgent child-a: %v", err)
+	}
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "child-b", MaxIterations: 5, Tools: extraTools}); err != nil {
+		t.Fatalf("RegisterAgent child-b: %v", err)
+	}
+	childATool, err := h.AgentAsTool("child-a")
+	if err != nil {
+		t.Fatalf("AgentAsTool child-a: %v", err)
+	}
+	childBTool, err := h.AgentAsTool("child-b")
+	if err != nil {
+		t.Fatalf("AgentAsTool child-b: %v", err)
+	}
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "parent", MaxIterations: 5, Tools: []sleipnir.Tool{childATool, childBTool}}); err != nil {
+		t.Fatalf("RegisterAgent parent: %v", err)
+	}
+
+	router := sleipnir.MapRouter{
+		Overrides: map[string]sleipnir.ModelConfig{
+			"child-a": {Provider: childAStub, Model: "stub"},
+			"child-b": {Provider: childBStub, Model: "stub"},
+			"parent":  {Provider: parentStub, Model: "stub"},
+		},
+	}
+	collector := sleipnirtest.NewEventCollector()
+
+	_, err = h.Run(context.Background(), sleipnir.RunInput{
+		AgentName: "parent",
+		Prompt:    "go",
+		Router:    router,
+		Events:    collector,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// child-a's read should contain "agent-a task" but NOT "agent-b task"
+	// child-b's read should contain "agent-b task" but NOT "agent-a task"
+	results := sleipnirtest.ByType[sleipnir.ToolResultEvent](collector)
+	checkRead := func(callID, agentName, wantContains, wantNotContains string) {
+		t.Helper()
+		for _, r := range results {
+			if r.ToolCallID == callID && r.AgentName == agentName {
+				if !strings.Contains(r.Result, wantContains) {
+					t.Errorf("%s todo_read %q: result %q does not contain %q", agentName, callID, r.Result, wantContains)
+				}
+				if strings.Contains(r.Result, wantNotContains) {
+					t.Errorf("%s todo_read %q: result %q unexpectedly contains %q (isolation failure)", agentName, callID, r.Result, wantNotContains)
+				}
+				return
+			}
+		}
+		t.Errorf("no ToolResultEvent for callID=%q agentName=%q", callID, agentName)
+	}
+	checkRead("ar1", "child-a", "agent-a task", "agent-b task")
+	checkRead("br1", "child-b", "agent-b task", "agent-a task")
+}
+
+// TestTodoReadEmptyList: todo_read before any todo_write returns "[]", no error.
+func TestTodoReadEmptyList(t *testing.T) {
+	stub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("todo_read", "r1", []byte(`{}`)),
+		sleipnirtest.TextResponse("done"),
+	)
+	h := mustNewHarness(t, sleipnir.Config{})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "agent", MaxIterations: 5}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+
+	collector := sleipnirtest.NewEventCollector()
+	_, err := h.Run(context.Background(), sleipnir.RunInput{
+		AgentName:  "agent",
+		Prompt:     "go",
+		Router:     defaultRouter(stub),
+		ExtraTools: []sleipnir.Tool{sleipnir.TodoReadTool()},
+		Events:     collector,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	results := sleipnirtest.ByType[sleipnir.ToolResultEvent](collector)
+	var found bool
+	for _, r := range results {
+		if r.ToolCallID == "r1" {
+			found = true
+			if r.IsError {
+				t.Errorf("todo_read on empty list returned IsError=true")
+			}
+			if r.Result != "[]" {
+				t.Errorf("todo_read on empty list = %q, want %q", r.Result, "[]")
+			}
+		}
+	}
+	if !found {
+		t.Error("no ToolResultEvent for todo_read r1")
+	}
+}
