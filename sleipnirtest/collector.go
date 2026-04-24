@@ -3,8 +3,10 @@ package sleipnirtest
 import (
 	"errors"
 	"sync"
+	"testing"
 
 	"sleipnir.dev/sleipnir"
+	"sleipnir.dev/sleipnir/middleware/accounting"
 )
 
 // EventCollector implements Sink and accumulates all sent events.
@@ -60,6 +62,16 @@ func (c *EventCollector) CheckCompleted() error {
 // ToolCalls returns all ToolCallEvents collected.
 func (c *EventCollector) ToolCalls() []sleipnir.ToolCallEvent {
 	return ByType[sleipnir.ToolCallEvent](c)
+}
+
+// AssertTokenInvariant verifies that TokenAccountant.Total().TotalTokens equals
+// RunOutput.Usage.TotalTokens. Call immediately after Run returns.
+func AssertTokenInvariant(t testing.TB, accountant *accounting.TokenAccountant, out sleipnir.RunOutput) {
+	t.Helper()
+	got, want := accountant.Total().TotalTokens, out.Usage.TotalTokens
+	if got != want {
+		t.Errorf("token invariant: TokenAccountant.Total=%d, RunOutput.Usage.TotalTokens=%d", got, want)
+	}
 }
 
 // ByType returns all events in c that are of type T.
