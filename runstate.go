@@ -12,7 +12,9 @@ type runState struct {
 	tokensUsed  atomic.Int64
 	tokenBudget int64 // 0 = unlimited
 
-	// Keyed by ToolCallID. Populated by TodoWriteTool / TodoReadTool (chunk 16).
+	// Keyed by agent name. Populated by TodoWriteTool / TodoReadTool.
+	// Agent-name keying provides cross-turn persistence; same-agent parallel
+	// invocations are not isolated from each other (last write wins).
 	todos sync.Map // map[string][]TodoItem
 }
 
