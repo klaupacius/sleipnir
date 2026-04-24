@@ -1,9 +1,11 @@
 package sleipnirtest
 
 import (
+	"context"
 	"testing"
 
 	"sleipnir.dev/sleipnir"
+	"sleipnir.dev/sleipnir/middleware/accounting"
 )
 
 var _ sleipnir.Sink = (*EventCollector)(nil)
@@ -186,4 +188,14 @@ func TestCollectorCheckCompleted(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAssertTokenInvariantPasses(t *testing.T) {
+	a := &accounting.TokenAccountant{}
+	req := &sleipnir.LLMRequest{Agent: sleipnir.AgentInfo{Name: "agent"}}
+	resp := &sleipnir.LLMResponse{Usage: sleipnir.Usage{InputTokens: 10, OutputTokens: 5, TotalTokens: 15}}
+	a.OnLLMCall(context.Background(), req, resp, nil)
+
+	out := sleipnir.RunOutput{Usage: sleipnir.Usage{TotalTokens: 15}}
+	AssertTokenInvariant(t, a, out)
 }
