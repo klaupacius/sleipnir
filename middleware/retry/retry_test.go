@@ -28,17 +28,26 @@ func TestDefaultRetryPolicyNonRetryable(t *testing.T) {
 	p := DefaultRetryPolicy{}
 	ctx := context.Background()
 
-	otherErr := errors.New("other")
-	retry, backoff := p.ShouldRetry(ctx, 0, otherErr)
-	if retry {
-		t.Errorf("expected retry=false for non-retryable error, got true")
-	}
-	if backoff != 0 {
-		t.Errorf("expected zero backoff for non-retryable error, got %v", backoff)
+	for _, err := range []error{
+		errors.New("other"),
+		anyllm.ErrInvalidRequest,
+		anyllm.ErrContextLength,
+		anyllm.ErrAuthentication,
+		anyllm.ErrContentFilter,
+		anyllm.ErrModelNotFound,
+		anyllm.ErrMissingAPIKey,
+	} {
+		retry, backoff := p.ShouldRetry(ctx, 0, err)
+		if retry {
+			t.Errorf("expected retry=false for %v, got true", err)
+		}
+		if backoff != 0 {
+			t.Errorf("expected zero backoff for %v, got %v", err, backoff)
+		}
 	}
 
 	// nil error
-	retry, backoff = p.ShouldRetry(ctx, 0, nil)
+	retry, backoff := p.ShouldRetry(ctx, 0, nil)
 	if retry {
 		t.Errorf("expected retry=false for nil error, got true")
 	}
@@ -55,7 +64,7 @@ func TestDefaultRetryPolicyBackoffIncreases(t *testing.T) {
 	ctx := context.Background()
 
 	const iterations = 100
-	for i := 0; i < iterations; i++ {
+	for range iterations {
 		_, b0 := p.ShouldRetry(ctx, 0, anyllm.ErrRateLimit)
 		_, b1 := p.ShouldRetry(ctx, 1, anyllm.ErrRateLimit)
 

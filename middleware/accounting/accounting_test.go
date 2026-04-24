@@ -96,10 +96,10 @@ func TestTokenAccountantConcurrentSafe(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(goroutines)
-	for i := 0; i < goroutines; i++ {
+	for range goroutines {
 		go func() {
 			defer wg.Done()
-			for j := 0; j < callsPerGoroutine; j++ {
+			for range callsPerGoroutine {
 				a.OnLLMCall(ctx, makeReq("agent"), makeResp(1, 1, 2), nil)
 			}
 		}()
