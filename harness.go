@@ -12,6 +12,14 @@ import (
 	anyllm "github.com/mozilla-ai/any-llm-go"
 )
 
+// Context keys used to inject harness state into tool invocations.
+type (
+	sinkCtxKey        struct{}
+	agentNameCtxKey   struct{}
+	toolCallIDCtxKey  struct{}
+	hitlTimeoutCtxKey struct{}
+)
+
 // subAgentTool is a marker interface for tools that represent sub-agents.
 // dispatchInParallel detects this interface to invoke runLoop recursively
 // instead of calling Invoke directly.
@@ -185,6 +193,10 @@ func (h *Harness) Run(ctx context.Context, in RunInput) (RunOutput, error) {
 
 func (h *Harness) runLoop(ctx context.Context, spec AgentSpec, in RunInput, parentName string, depth int, rs *runState) (RunOutput, error) {
 	ctx = WithCompactStore(ctx, &syncMapCompactStore{})
+	ctx = context.WithValue(ctx, sinkCtxKey{}, in.Events)
+	ctx = context.WithValue(ctx, agentNameCtxKey{}, spec.Name)
+	ctx = context.WithValue(ctx, hitlTimeoutCtxKey{}, h.cfg.HITLTimeout)
+	ctx = context.WithValue(ctx, toolCallIDCtxKey{}, "__root__")
 
 	agentInfo := AgentInfo{
 		Name:       spec.Name,
@@ -297,6 +309,16 @@ func (h *Harness) runLoop(ctx context.Context, spec AgentSpec, in RunInput, pare
 
 		toolResults := dispatchInParallel(ctx, resp.Message.ToolCalls, toolMap, agentInfo, in, h, rs, mws, in.Events, spec.MaxParallelTools)
 		for _, r := range toolResults {
+			if r.infraErr != nil {
+				if errors.Is(r.infraErr, ErrHITLTimeout) || errors.Is(r.infraErr, ErrHITLCancelled) ||
+					errors.Is(r.infraErr, context.Canceled) || errors.Is(r.infraErr, context.DeadlineExceeded) {
+					stop := stopReasonForErr(r.infraErr)
+					emit(in.Events, AgentEndEvent{AgentName: spec.Name, Usage: localUsage, Stopped: stop})
+					return RunOutput{Messages: history, Usage: localUsage, Stopped: stop}, r.infraErr
+				}
+			}
+		}
+		for _, r := range toolResults {
 			localUsage.InputTokens += r.subUsage.InputTokens
 			localUsage.OutputTokens += r.subUsage.OutputTokens
 			localUsage.TotalTokens += r.subUsage.TotalTokens
@@ -374,8 +396,19 @@ func dispatchInParallel(
 					}
 				}
 			} else {
-				res, infraErr = tool.Invoke(ctx, json.RawMessage(call.Function.Arguments))
+				invokeCtx := context.WithValue(ctx, toolCallIDCtxKey{}, call.ID)
+				res, infraErr = tool.Invoke(invokeCtx, json.RawMessage(call.Function.Arguments))
 				if infraErr != nil {
+					if errors.Is(infraErr, ErrHITLTimeout) || errors.Is(infraErr, ErrHITLCancelled) ||
+						errors.Is(infraErr, context.Canceled) || errors.Is(infraErr, context.DeadlineExceeded) {
+						results[i] = toolCallResult{
+							callID:   call.ID,
+							result:   ToolResult{IsError: true, Content: infraErr.Error()},
+							infraErr: infraErr,
+						}
+						// Don't emit ErrorEvent for HITL/ctx errors — they terminate the run
+						return
+					}
 					res = ToolResult{IsError: true, Content: "tool execution failed: " + infraErr.Error()}
 					emit(sink, ErrorEvent{AgentName: agent.Name, Err: infraErr})
 				}
@@ -456,6 +489,18 @@ func toolResultMessages(results []toolCallResult) []anyllm.Message {
 func emit(sink Sink, e Event) {
 	if sink != nil {
 		sink.Send(e)
+	}
+}
+
+// stopReasonForErr maps a fatal infra error to its corresponding StopReason.
+func stopReasonForErr(err error) StopReason {
+	switch {
+	case errors.Is(err, ErrHITLTimeout):
+		return StopHITLTimeout
+	case errors.Is(err, ErrHITLCancelled):
+		return StopHITLCancelled
+	default:
+		return StopDone
 	}
 }
 

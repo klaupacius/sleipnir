@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	sleipnir "sleipnir.dev/sleipnir"
 	"sleipnir.dev/sleipnir/sleipnirtest"
@@ -1504,5 +1505,318 @@ func TestRunUsageIncludesSubAgent(t *testing.T) {
 	wantTotal := int64(45)
 	if out.Usage.TotalTokens != wantTotal {
 		t.Errorf("TotalTokens = %d, want %d", out.Usage.TotalTokens, wantTotal)
+	}
+}
+
+// --- Chunk 15: HITL tests ---
+
+// funcHITLHandler is a test helper that wraps a function as a HITLHandler.
+type funcHITLHandler struct {
+	fn func(ctx context.Context, agent, question, contextBlurb string) (string, error)
+}
+
+func (h *funcHITLHandler) AskUser(ctx context.Context, agent, question, contextBlurb string) (string, error) {
+	return h.fn(ctx, agent, question, contextBlurb)
+}
+
+// TestAskUserToolInvoked: agent calls ask_user; handler returns "user reply"; run ends with StopDone.
+func TestAskUserToolInvoked(t *testing.T) {
+	handler := &funcHITLHandler{
+		fn: func(_ context.Context, _, _, _ string) (string, error) {
+			return "user reply", nil
+		},
+	}
+	askTool := sleipnir.AskUserTool(handler)
+
+	stub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("ask_user", "q-1", []byte(`{"question":"What is your name?"}`)),
+		sleipnirtest.TextResponse("Thanks for the reply"),
+	)
+	h := mustNewHarness(t, sleipnir.Config{})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "agent", MaxIterations: 5}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+
+	out, err := h.Run(context.Background(), sleipnir.RunInput{
+		AgentName:  "agent",
+		Prompt:     "go",
+		Router:     defaultRouter(stub),
+		ExtraTools: []sleipnir.Tool{askTool},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if out.Stopped != sleipnir.StopDone {
+		t.Errorf("Stopped = %q, want StopDone", out.Stopped)
+	}
+	if out.Text != "Thanks for the reply" {
+		t.Errorf("Text = %q, want %q", out.Text, "Thanks for the reply")
+	}
+}
+
+// TestAskUserToolQuestionEvent: QuestionEvent appears before ToolResultEvent for the same ToolCallID.
+func TestAskUserToolQuestionEvent(t *testing.T) {
+	handler := &funcHITLHandler{
+		fn: func(_ context.Context, _, _, _ string) (string, error) {
+			return "answer", nil
+		},
+	}
+	askTool := sleipnir.AskUserTool(handler)
+
+	stub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("ask_user", "q-2", []byte(`{"question":"Ready?"}`)),
+		sleipnirtest.TextResponse("done"),
+	)
+	h := mustNewHarness(t, sleipnir.Config{})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "agent", MaxIterations: 5}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+
+	collector := sleipnirtest.NewEventCollector()
+	if _, err := h.Run(context.Background(), sleipnir.RunInput{
+		AgentName:  "agent",
+		Prompt:     "go",
+		Router:     defaultRouter(stub),
+		ExtraTools: []sleipnir.Tool{askTool},
+		Events:     collector,
+	}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	events := collector.Events()
+	var questionIdx, toolResultIdx int = -1, -1
+	for i, e := range events {
+		switch ev := e.(type) {
+		case sleipnir.QuestionEvent:
+			if ev.QuestionID == "q-2" {
+				questionIdx = i
+			}
+		case sleipnir.ToolResultEvent:
+			if ev.ToolCallID == "q-2" {
+				toolResultIdx = i
+			}
+		}
+	}
+
+	if questionIdx < 0 {
+		t.Fatal("QuestionEvent not found")
+	}
+	if toolResultIdx < 0 {
+		t.Fatal("ToolResultEvent not found")
+	}
+	if questionIdx >= toolResultIdx {
+		t.Errorf("QuestionEvent (idx %d) must precede ToolResultEvent (idx %d)", questionIdx, toolResultIdx)
+	}
+}
+
+// TestAskUserToolTimeout: very short HITLTimeout causes run to return ErrHITLTimeout + StopHITLTimeout.
+func TestAskUserToolTimeout(t *testing.T) {
+	handler := &funcHITLHandler{
+		fn: func(ctx context.Context, _, _, _ string) (string, error) {
+			<-ctx.Done()
+			return "", ctx.Err()
+		},
+	}
+	askTool := sleipnir.AskUserTool(handler)
+
+	stub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("ask_user", "q-3", []byte(`{"question":"Slow?"}`)),
+		// This second response should never be reached.
+		sleipnirtest.TextResponse("done"),
+	)
+	h := mustNewHarness(t, sleipnir.Config{HITLTimeout: time.Millisecond})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "agent", MaxIterations: 5}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+
+	out, err := h.Run(context.Background(), sleipnir.RunInput{
+		AgentName:  "agent",
+		Prompt:     "go",
+		Router:     defaultRouter(stub),
+		ExtraTools: []sleipnir.Tool{askTool},
+	})
+	if !errors.Is(err, sleipnir.ErrHITLTimeout) {
+		t.Errorf("err = %v, want ErrHITLTimeout", err)
+	}
+	if out.Stopped != sleipnir.StopHITLTimeout {
+		t.Errorf("Stopped = %q, want StopHITLTimeout", out.Stopped)
+	}
+}
+
+// TestAskUserToolCancelled: cancel outer ctx causes run to return ErrHITLCancelled + StopHITLCancelled.
+func TestAskUserToolCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	ready := make(chan struct{})
+	handler := &funcHITLHandler{
+		fn: func(hCtx context.Context, _, _, _ string) (string, error) {
+			close(ready) // signal that handler is running
+			<-hCtx.Done()
+			return "", hCtx.Err()
+		},
+	}
+	askTool := sleipnir.AskUserTool(handler)
+
+	stub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("ask_user", "q-4", []byte(`{"question":"Cancel me?"}`)),
+		sleipnirtest.TextResponse("done"),
+	)
+	h := mustNewHarness(t, sleipnir.Config{})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "agent", MaxIterations: 5}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+
+	errCh := make(chan error, 1)
+	outCh := make(chan sleipnir.RunOutput, 1)
+	go func() {
+		o, e := h.Run(ctx, sleipnir.RunInput{
+			AgentName:  "agent",
+			Prompt:     "go",
+			Router:     defaultRouter(stub),
+			ExtraTools: []sleipnir.Tool{askTool},
+		})
+		outCh <- o
+		errCh <- e
+	}()
+
+	// Wait until handler is running, then cancel.
+	<-ready
+	cancel()
+
+	out := <-outCh
+	err := <-errCh
+
+	if !errors.Is(err, sleipnir.ErrHITLCancelled) {
+		t.Errorf("err = %v, want ErrHITLCancelled", err)
+	}
+	if out.Stopped != sleipnir.StopHITLCancelled {
+		t.Errorf("Stopped = %q, want StopHITLCancelled", out.Stopped)
+	}
+}
+
+// TestAskUserToolNilHandler: AskUserTool(nil) returns IsError=true; run continues to StopDone.
+func TestAskUserToolNilHandler(t *testing.T) {
+	askTool := sleipnir.AskUserTool(nil)
+
+	stub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("ask_user", "q-5", []byte(`{"question":"Anyone home?"}`)),
+		sleipnirtest.TextResponse("done"),
+	)
+	h := mustNewHarness(t, sleipnir.Config{})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "agent", MaxIterations: 5}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+
+	collector := sleipnirtest.NewEventCollector()
+	out, err := h.Run(context.Background(), sleipnir.RunInput{
+		AgentName:  "agent",
+		Prompt:     "go",
+		Router:     defaultRouter(stub),
+		ExtraTools: []sleipnir.Tool{askTool},
+		Events:     collector,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if out.Stopped != sleipnir.StopDone {
+		t.Errorf("Stopped = %q, want StopDone", out.Stopped)
+	}
+
+	// The ToolResultEvent for ask_user should have IsError == true.
+	toolResults := sleipnirtest.ByType[sleipnir.ToolResultEvent](collector)
+	var found bool
+	for _, e := range toolResults {
+		if e.ToolCallID == "q-5" {
+			found = true
+			if !e.IsError {
+				t.Errorf("ToolResultEvent.IsError = false, want true for nil handler")
+			}
+		}
+	}
+	if !found {
+		t.Error("ToolResultEvent for ask_user not found")
+	}
+}
+
+// TestAskUserToolParallel: two parallel ask_user calls both complete; run ends with StopDone.
+func TestAskUserToolParallel(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		inflight int
+		maxSeen  int
+	)
+	// Block both handlers until both are in-flight.
+	gate := make(chan struct{})
+
+	handler := &funcHITLHandler{
+		fn: func(_ context.Context, _, _, _ string) (string, error) {
+			mu.Lock()
+			inflight++
+			if inflight > maxSeen {
+				maxSeen = inflight
+			}
+			mu.Unlock()
+
+			<-gate // wait for test to release
+
+			mu.Lock()
+			inflight--
+			mu.Unlock()
+			return "parallel reply", nil
+		},
+	}
+	askTool := sleipnir.AskUserTool(handler)
+
+	stub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.MultiToolCallResponse(
+			anyllm.ToolCall{ID: "p-1", Function: anyllm.FunctionCall{Name: "ask_user", Arguments: `{"question":"Q1"}`}},
+			anyllm.ToolCall{ID: "p-2", Function: anyllm.FunctionCall{Name: "ask_user", Arguments: `{"question":"Q2"}`}},
+		),
+		sleipnirtest.TextResponse("all done"),
+	)
+	h := mustNewHarness(t, sleipnir.Config{})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "agent", MaxIterations: 5}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+
+	errCh := make(chan error, 1)
+	outCh := make(chan sleipnir.RunOutput, 1)
+	go func() {
+		o, e := h.Run(context.Background(), sleipnir.RunInput{
+			AgentName:  "agent",
+			Prompt:     "go",
+			Router:     defaultRouter(stub),
+			ExtraTools: []sleipnir.Tool{askTool},
+		})
+		outCh <- o
+		errCh <- e
+	}()
+
+	// Wait until both handlers are in-flight, then release.
+	for {
+		mu.Lock()
+		n := inflight
+		mu.Unlock()
+		if n >= 2 {
+			break
+		}
+		// yield
+		var s sync.Mutex
+		s.Lock()
+		s.Unlock()
+	}
+	close(gate) // release both handlers
+
+	out := <-outCh
+	err := <-errCh
+
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if out.Stopped != sleipnir.StopDone {
+		t.Errorf("Stopped = %q, want StopDone", out.Stopped)
+	}
+	if maxSeen < 2 {
+		t.Errorf("max concurrent handlers = %d, want >= 2", maxSeen)
 	}
 }
