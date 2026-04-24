@@ -3,6 +3,7 @@ package compact
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	anyllm "github.com/mozilla-ai/any-llm-go"
 	sleipnir "sleipnir.dev/sleipnir"
@@ -79,10 +80,15 @@ func (c *Compactor) RewriteBeforeLLMCall(ctx context.Context, req *sleipnir.LLMR
 }
 
 func (c *Compactor) summarize(ctx context.Context, msgs []anyllm.Message) (string, error) {
-	prompt := "Summarize the following conversation concisely:\n\n"
+	var sb strings.Builder
+	sb.WriteString("Summarize the following conversation concisely:\n\n")
 	for _, m := range msgs {
-		prompt += m.Role + ": " + m.ContentString() + "\n"
+		sb.WriteString(string(m.Role))
+		sb.WriteString(": ")
+		sb.WriteString(m.ContentString())
+		sb.WriteByte('\n')
 	}
+	prompt := sb.String()
 	params := anyllm.CompletionParams{
 		Model: c.cfg.Model,
 		Messages: []anyllm.Message{
