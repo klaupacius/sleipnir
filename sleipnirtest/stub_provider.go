@@ -3,17 +3,24 @@ package sleipnirtest
 import (
 	"context"
 	"encoding/json"
+	"regexp"
 	"sync"
 	"testing"
 
 	anyllm "github.com/mozilla-ai/any-llm-go"
 )
 
+type stubMatcher struct {
+	pattern *regexp.Regexp
+	resp    *anyllm.ChatCompletion
+}
+
 type StubProvider struct {
 	t         *testing.T
 	responses []*anyllm.ChatCompletion
 	mu        sync.Mutex
 	index     int
+	matchers  []stubMatcher
 }
 
 func NewStubProvider(t *testing.T, responses ...*anyllm.ChatCompletion) *StubProvider {
@@ -24,10 +31,40 @@ func (s *StubProvider) Name() string {
 	return "stub_provider"
 }
 
-// Completion implements anyllm.Provider
-func (s *StubProvider) Completion(_ context.Context, _ anyllm.CompletionParams) (*anyllm.ChatCompletion, error) {
+// WhenMessageMatches registers a response for calls where the last user
+// message content matches pattern. Checked before the scripted sequence.
+// Returns the receiver for chaining.
+func (s *StubProvider) WhenMessageMatches(pattern *regexp.Regexp, resp *anyllm.ChatCompletion) *StubProvider {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.matchers = append(s.matchers, stubMatcher{pattern, resp})
+	return s
+}
+
+// Completion implements anyllm.Provider
+func (s *StubProvider) Completion(_ context.Context, params anyllm.CompletionParams) (*anyllm.ChatCompletion, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Find the last user message content for matcher checks.
+	var lastUserContent string
+	for i := len(params.Messages) - 1; i >= 0; i-- {
+		if params.Messages[i].Role == anyllm.RoleUser {
+			if s, ok := params.Messages[i].Content.(string); ok {
+				lastUserContent = s
+			}
+			break
+		}
+	}
+
+	// Check matchers first; don't advance the scripted index.
+	for _, m := range s.matchers {
+		if m.pattern.MatchString(lastUserContent) {
+			return m.resp, nil
+		}
+	}
+
+	// Fall through to scripted sequence.
 	if s.index >= len(s.responses) {
 		s.t.Fatalf("StubProvider: no more scripted responses (called %d times, have %d)", s.index+1, len(s.responses))
 	}
