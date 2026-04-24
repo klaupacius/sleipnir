@@ -29,13 +29,18 @@ func (r *CachedRouter) Resolve(ctx context.Context, agentName string) (ModelConf
 	}
 	r.mu.RUnlock()
 
+	// Hold the write lock while calling inner so concurrent misses for the same
+	// agent name don't produce multiple inner.Resolve calls (TOCTOU).
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if cfg, ok := r.cache[agentName]; ok {
+		return cfg, nil
+	}
 	cfg, err := r.inner.Resolve(ctx, agentName)
 	if err != nil {
 		return ModelConfig{}, err
 	}
-	r.mu.Lock()
 	r.cache[agentName] = cfg
-	r.mu.Unlock()
 	return cfg, nil
 }
 
