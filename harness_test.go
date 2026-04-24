@@ -1404,7 +1404,7 @@ func TestRunTokenBudgetSubAgentContributes(t *testing.T) {
 	}
 
 	// Budget = 20: parent first call (15) stays under; child call (15) pushes total to 30.
-	_, err := h.Run(context.Background(), sleipnir.RunInput{
+	out, err := h.Run(context.Background(), sleipnir.RunInput{
 		AgentName:      "parent",
 		Prompt:         "go",
 		Router:         router,
@@ -1412,6 +1412,9 @@ func TestRunTokenBudgetSubAgentContributes(t *testing.T) {
 	})
 	if !errors.Is(err, sleipnir.ErrTokenBudget) {
 		t.Fatalf("expected ErrTokenBudget, got %v", err)
+	}
+	if out.Stopped != sleipnir.StopTokenBudget {
+		t.Errorf("expected StopTokenBudget, got %q", out.Stopped)
 	}
 }
 
