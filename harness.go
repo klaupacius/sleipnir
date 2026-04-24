@@ -178,10 +178,11 @@ func (h *Harness) Run(ctx context.Context, in RunInput) (RunOutput, error) {
 	}
 	spec := raw.(AgentSpec)
 
-	return h.runLoop(ctx, spec, in, "", 0)
+	rs := newRunState(in.MaxTotalTokens)
+	return h.runLoop(ctx, spec, in, "", 0, rs)
 }
 
-func (h *Harness) runLoop(ctx context.Context, spec AgentSpec, in RunInput, parentName string, depth int) (RunOutput, error) {
+func (h *Harness) runLoop(ctx context.Context, spec AgentSpec, in RunInput, parentName string, depth int, rs *runState) (RunOutput, error) {
 	agentInfo := AgentInfo{
 		Name:       spec.Name,
 		ParentName: parentName,
@@ -224,7 +225,7 @@ func (h *Harness) runLoop(ctx context.Context, spec AgentSpec, in RunInput, pare
 		})
 	}
 
-	var totalUsage Usage
+	var localUsage Usage
 
 	for i := 0; i < spec.MaxIterations; i++ {
 		modelCfg, err := in.Router.Resolve(ctx, spec.Name)
@@ -244,9 +245,21 @@ func (h *Harness) runLoop(ctx context.Context, spec AgentSpec, in RunInput, pare
 			return RunOutput{}, err
 		}
 
-		totalUsage.InputTokens += resp.Usage.InputTokens
-		totalUsage.OutputTokens += resp.Usage.OutputTokens
-		totalUsage.TotalTokens += resp.Usage.TotalTokens
+		localUsage.InputTokens += resp.Usage.InputTokens
+		localUsage.OutputTokens += resp.Usage.OutputTokens
+		localUsage.TotalTokens += resp.Usage.TotalTokens
+
+		rs.addTokens(resp.Usage)
+
+		if rs.overBudget() {
+			history = append(history, resp.Message)
+			emit(in.Events, AgentEndEvent{AgentName: spec.Name, Usage: localUsage, Stopped: StopTokenBudget})
+			return RunOutput{
+				Messages: history,
+				Usage:    localUsage,
+				Stopped:  StopTokenBudget,
+			}, ErrTokenBudget
+		}
 
 		if resp.Message.Content != "" {
 			emit(in.Events, TokenEvent{AgentName: spec.Name, Text: resp.Message.ContentString()})
@@ -261,25 +274,31 @@ func (h *Harness) runLoop(ctx context.Context, spec AgentSpec, in RunInput, pare
 			out := RunOutput{
 				Text:     resp.Message.ContentString(),
 				Messages: history,
-				Usage:    totalUsage,
+				Usage:    localUsage,
 				Stopped:  StopDone,
 			}
 			emit(in.Events, AgentEndEvent{AgentName: spec.Name, Usage: out.Usage, Stopped: StopDone})
 			return out, nil
 		}
 
-		toolResults := dispatchInParallel(ctx, resp.Message.ToolCalls, toolMap, spec.Name, depth, in, h, in.Events, spec.MaxParallelTools)
+		toolResults := dispatchInParallel(ctx, resp.Message.ToolCalls, toolMap, spec.Name, depth, in, h, rs, in.Events, spec.MaxParallelTools)
+		for _, r := range toolResults {
+			localUsage.InputTokens += r.subUsage.InputTokens
+			localUsage.OutputTokens += r.subUsage.OutputTokens
+			localUsage.TotalTokens += r.subUsage.TotalTokens
+		}
 		history = append(history, toolResultMessages(toolResults)...)
 	}
 
-	emit(in.Events, AgentEndEvent{AgentName: spec.Name, Usage: totalUsage, Stopped: StopIterationBudget})
-	return RunOutput{Messages: history, Usage: totalUsage, Stopped: StopIterationBudget}, ErrIterationBudget
+	emit(in.Events, AgentEndEvent{AgentName: spec.Name, Usage: localUsage, Stopped: StopIterationBudget})
+	return RunOutput{Messages: history, Usage: localUsage, Stopped: StopIterationBudget}, ErrIterationBudget
 }
 
 type toolCallResult struct {
 	callID   string
 	result   ToolResult
 	infraErr error
+	subUsage Usage // non-zero for sub-agent calls; zero for ordinary tool calls
 }
 
 func dispatchInParallel(
@@ -290,6 +309,7 @@ func dispatchInParallel(
 	depth int,
 	parentIn RunInput,
 	h *Harness,
+	rs *runState,
 	sink Sink,
 	maxParallel int,
 ) []toolCallResult {
@@ -324,6 +344,7 @@ func dispatchInParallel(
 			tool, ok := toolMap[call.Function.Name]
 			var res ToolResult
 			var infraErr error
+			var subUsage Usage
 			if !ok {
 				res = ToolResult{IsError: true, Content: "unknown tool: " + call.Function.Name}
 			} else if sat, isSAT := tool.(subAgentTool); isSAT {
@@ -332,8 +353,11 @@ func dispatchInParallel(
 				if !specFound {
 					res = ToolResult{IsError: true, Content: "sub-agent not registered: " + sat.subAgentName()}
 				} else {
-					childOut, childErr := h.runLoop(ctx, childSpecRaw.(AgentSpec), childIn, agentName, depth+1)
+					childOut, childErr := h.runLoop(ctx, childSpecRaw.(AgentSpec), childIn, agentName, depth+1, rs)
 					res, infraErr = subAgentResultToToolResult(childOut, childErr)
+					if childErr == nil || errors.Is(childErr, ErrIterationBudget) || errors.Is(childErr, ErrTokenBudget) {
+						subUsage = childOut.Usage
+					}
 				}
 			} else {
 				res, infraErr = tool.Invoke(ctx, json.RawMessage(call.Function.Arguments))
@@ -349,7 +373,7 @@ func dispatchInParallel(
 				Result:     res.Content,
 				IsError:    res.IsError,
 			})
-			results[i] = toolCallResult{callID: call.ID, result: res, infraErr: infraErr}
+			results[i] = toolCallResult{callID: call.ID, result: res, infraErr: infraErr, subUsage: subUsage}
 		}(i, call)
 	}
 	wg.Wait()

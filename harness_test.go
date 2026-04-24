@@ -1269,3 +1269,237 @@ func TestRunSubAgentContextCancel(t *testing.T) {
 		t.Errorf("expected context.Canceled, got %v", err)
 	}
 }
+
+// MaxTotalTokens: 0 -> unlimited; run completes with StopDone regardless of usage.
+func TestRunTokenBudgetUnlimited(t *testing.T) {
+	h := mustNewHarness(t, sleipnir.Config{})
+	stub := sleipnirtest.NewStubProvider(t, sleipnirtest.TextResponse("done"))
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "agent", MaxIterations: 5}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+
+	out, err := h.Run(context.Background(), sleipnir.RunInput{
+		AgentName:      "agent",
+		Prompt:         "hi",
+		Router:         defaultRouter(stub),
+		MaxTotalTokens: 0, // unlimited
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if out.Stopped != sleipnir.StopDone {
+		t.Errorf("expected StopDone, got %q", out.Stopped)
+	}
+}
+
+// Budget set above total usage -> StopDone, no error.
+func TestRunTokenBudgetNotExceeded(t *testing.T) {
+	h := mustNewHarness(t, sleipnir.Config{})
+	// One response: TotalTokens = 15; budget = 100
+	stub := sleipnirtest.NewStubProvider(t, sleipnirtest.TextResponse("ok"))
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "agent", MaxIterations: 5}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+
+	out, err := h.Run(context.Background(), sleipnir.RunInput{
+		AgentName:      "agent",
+		Prompt:         "hi",
+		Router:         defaultRouter(stub),
+		MaxTotalTokens: 100,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if out.Stopped != sleipnir.StopDone {
+		t.Errorf("expected StopDone, got %q", out.Stopped)
+	}
+}
+
+// Budget set below first response's usage -> ErrTokenBudget, StopTokenBudget, partial history.
+func TestRunTokenBudgetExceeded(t *testing.T) {
+	h := mustNewHarness(t, sleipnir.Config{})
+	// StubProvider TotalTokens = 15 per response; budget = 10 < 15
+	stub := sleipnirtest.NewStubProvider(t, sleipnirtest.TextResponse("should not appear"))
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "agent", MaxIterations: 5}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+
+	out, err := h.Run(context.Background(), sleipnir.RunInput{
+		AgentName:      "agent",
+		Prompt:         "hi",
+		Router:         defaultRouter(stub),
+		MaxTotalTokens: 10, // budget < 15 tokens from first response
+	})
+	if !errors.Is(err, sleipnir.ErrTokenBudget) {
+		t.Fatalf("expected ErrTokenBudget, got %v", err)
+	}
+	if out.Stopped != sleipnir.StopTokenBudget {
+		t.Errorf("expected StopTokenBudget, got %q", out.Stopped)
+	}
+	if len(out.Messages) == 0 {
+		t.Error("expected non-empty Messages in partial history")
+	}
+}
+
+// Budget exactly equals usage -> StopTokenBudget (budget check uses >=).
+func TestRunTokenBudgetExactlyMet(t *testing.T) {
+	h := mustNewHarness(t, sleipnir.Config{})
+	// StubProvider TotalTokens = 15; budget = 15 exactly
+	stub := sleipnirtest.NewStubProvider(t, sleipnirtest.TextResponse("exact"))
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "agent", MaxIterations: 5}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+
+	out, err := h.Run(context.Background(), sleipnir.RunInput{
+		AgentName:      "agent",
+		Prompt:         "hi",
+		Router:         defaultRouter(stub),
+		MaxTotalTokens: 15, // budget == 15 tokens from first response
+	})
+	if !errors.Is(err, sleipnir.ErrTokenBudget) {
+		t.Fatalf("expected ErrTokenBudget, got %v", err)
+	}
+	if out.Stopped != sleipnir.StopTokenBudget {
+		t.Errorf("expected StopTokenBudget, got %q", out.Stopped)
+	}
+}
+
+// Sub-agent token usage contributes to shared budget; combined usage exceeds budget.
+func TestRunTokenBudgetSubAgentContributes(t *testing.T) {
+	// Parent: budget = 20. Parent first response = 15 tokens (under budget).
+	// Sub-agent response = 15 tokens -> shared total = 30 (> 20).
+	// The child's runLoop sees overBudget() after its own response, so it returns ErrTokenBudget.
+	// subAgentResultToToolResult converts that to an IsError ToolResult (not an infraErr),
+	// so the parent gets an error tool result and continues. On the parent's next LLM call,
+	// the shared counter (30) is already over budget (20), triggering ErrTokenBudget for the parent.
+	h := mustNewHarness(t, sleipnir.Config{AllowLateRegistration: true})
+
+	childStub := sleipnirtest.NewStubProvider(t, sleipnirtest.TextResponse("child done"))
+	parentStub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("child", "tc-1", []byte(`{}`)),
+		sleipnirtest.TextResponse("parent done"),
+	)
+
+	if err := h.RegisterAgent(sleipnir.AgentSpec{
+		Name:          "child",
+		MaxIterations: 5,
+	}); err != nil {
+		t.Fatalf("RegisterAgent child: %v", err)
+	}
+	childTool, _ := h.AgentAsTool("child")
+	if err := h.RegisterAgent(sleipnir.AgentSpec{
+		Name:          "parent",
+		MaxIterations: 5,
+		Tools:         []sleipnir.Tool{childTool},
+	}); err != nil {
+		t.Fatalf("RegisterAgent parent: %v", err)
+	}
+
+	router := sleipnir.MapRouter{
+		Overrides: map[string]sleipnir.ModelConfig{
+			"child":  {Provider: childStub, Model: "stub"},
+			"parent": {Provider: parentStub, Model: "stub"},
+		},
+		Default: sleipnir.ModelConfig{Provider: parentStub, Model: "stub"},
+	}
+
+	// Budget = 20: parent first call (15) stays under; child call (15) pushes total to 30.
+	_, err := h.Run(context.Background(), sleipnir.RunInput{
+		AgentName:      "parent",
+		Prompt:         "go",
+		Router:         router,
+		MaxTotalTokens: 20,
+	})
+	if !errors.Is(err, sleipnir.ErrTokenBudget) {
+		t.Fatalf("expected ErrTokenBudget, got %v", err)
+	}
+}
+
+// Multi-turn run via separate Run calls -> each RunOutput.Usage.TotalTokens equals per-run usage.
+func TestRunUsageAccumulated(t *testing.T) {
+	h := mustNewHarness(t, sleipnir.Config{AllowLateRegistration: true})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{Name: "agent", MaxIterations: 5}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+
+	stub1 := sleipnirtest.NewStubProvider(t, sleipnirtest.TextResponse("turn1"))
+	out1, err := h.Run(context.Background(), sleipnir.RunInput{
+		AgentName: "agent",
+		Prompt:    "hello",
+		Router:    defaultRouter(stub1),
+	})
+	if err != nil {
+		t.Fatalf("Run turn1: %v", err)
+	}
+
+	stub2 := sleipnirtest.NewStubProvider(t, sleipnirtest.TextResponse("turn2"))
+	out2, err := h.Run(context.Background(), sleipnir.RunInput{
+		AgentName: "agent",
+		History:   out1.Messages,
+		Prompt:    "continue",
+		Router:    defaultRouter(stub2),
+	})
+	if err != nil {
+		t.Fatalf("Run turn2: %v", err)
+	}
+
+	// Each Run creates an independent runState; each single-turn run reports TotalTokens = 15.
+	if out1.Usage.TotalTokens != 15 {
+		t.Errorf("turn1 TotalTokens = %d, want 15", out1.Usage.TotalTokens)
+	}
+	if out2.Usage.TotalTokens != 15 {
+		t.Errorf("turn2 TotalTokens = %d, want 15", out2.Usage.TotalTokens)
+	}
+}
+
+// Parent calls sub-agent; RunOutput.Usage.TotalTokens equals parent usage + sub-agent usage.
+func TestRunUsageIncludesSubAgent(t *testing.T) {
+	h := mustNewHarness(t, sleipnir.Config{AllowLateRegistration: true})
+
+	// child: 1 response = 15 tokens
+	childStub := sleipnirtest.NewStubProvider(t, sleipnirtest.TextResponse("child answer"))
+	// parent: tool call response (15 tokens) + final text response (15 tokens) = 30 tokens
+	parentStub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse("child", "tc-1", []byte(`{}`)),
+		sleipnirtest.TextResponse("parent answer"),
+	)
+
+	if err := h.RegisterAgent(sleipnir.AgentSpec{
+		Name:          "child",
+		MaxIterations: 5,
+	}); err != nil {
+		t.Fatalf("RegisterAgent child: %v", err)
+	}
+	childTool, _ := h.AgentAsTool("child")
+	if err := h.RegisterAgent(sleipnir.AgentSpec{
+		Name:          "parent",
+		MaxIterations: 5,
+		Tools:         []sleipnir.Tool{childTool},
+	}); err != nil {
+		t.Fatalf("RegisterAgent parent: %v", err)
+	}
+
+	router := sleipnir.MapRouter{
+		Overrides: map[string]sleipnir.ModelConfig{
+			"child":  {Provider: childStub, Model: "stub"},
+			"parent": {Provider: parentStub, Model: "stub"},
+		},
+		Default: sleipnir.ModelConfig{Provider: parentStub, Model: "stub"},
+	}
+
+	out, err := h.Run(context.Background(), sleipnir.RunInput{
+		AgentName: "parent",
+		Prompt:    "go",
+		Router:    router,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// parent: 2 LLM calls * 15 = 30 tokens local; child: 1 LLM call * 15 = 15 tokens sub-usage.
+	// Total reported in parent RunOutput = 30 (parent local) + 15 (sub-agent) = 45.
+	wantTotal := int64(45)
+	if out.Usage.TotalTokens != wantTotal {
+		t.Errorf("TotalTokens = %d, want %d", out.Usage.TotalTokens, wantTotal)
+	}
+}
