@@ -77,7 +77,7 @@ func TestCachedRouterCachesResult(t *testing.T) {
 	inner := &countingRouter{cfg: want}
 	cr := NewCachedRouter(inner)
 
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		got, err := cr.Resolve(context.Background(), "agent-a")
 		if err != nil {
 			t.Fatalf("call %d: unexpected error: %v", i, err)
@@ -145,7 +145,7 @@ func TestCachedRouterConcurrentSafe(t *testing.T) {
 	const goroutines = 10
 	var wg sync.WaitGroup
 	wg.Add(goroutines)
-	for i := 0; i < goroutines; i++ {
+	for range goroutines {
 		go func() {
 			defer wg.Done()
 			got, err := cr.Resolve(context.Background(), "shared-agent")
