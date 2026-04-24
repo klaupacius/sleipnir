@@ -74,6 +74,19 @@ func AssertTokenInvariant(t testing.TB, accountant *accounting.TokenAccountant, 
 	}
 }
 
+// TokensFor returns the Usage from the AgentEndEvent for the named agent.
+// Returns zero Usage if no AgentEndEvent was received for that agent.
+func (c *EventCollector) TokensFor(agentName string) sleipnir.Usage {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, e := range c.events {
+		if end, ok := e.(sleipnir.AgentEndEvent); ok && end.AgentName == agentName {
+			return end.Usage
+		}
+	}
+	return sleipnir.Usage{}
+}
+
 // ByType returns all events in c that are of type T.
 func ByType[T sleipnir.Event](c *EventCollector) []T {
 	c.mu.Lock()
