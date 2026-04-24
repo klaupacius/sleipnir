@@ -51,7 +51,7 @@ func MultiToolCallResponse(calls ...anyllm.ToolCall) *anyllm.ChatCompletion {
 			},
 			FinishReason: anyllm.FinishReasonToolCalls,
 		}},
-		Usage: &anyllm.Usage{PromptTokens: 10, CompletionTokens: 5},
+		Usage: &anyllm.Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15},
 	}
 }
 
@@ -71,7 +71,7 @@ func ToolCallResponse(toolName, toolCallID string, args json.RawMessage) *anyllm
 			},
 			FinishReason: anyllm.FinishReasonToolCalls,
 		}},
-		Usage: &anyllm.Usage{PromptTokens: 10, CompletionTokens: 5},
+		Usage: &anyllm.Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15},
 	}
 }
 
@@ -83,6 +83,6 @@ func TextResponse(text string) *anyllm.ChatCompletion {
 			Message:      anyllm.Message{Role: anyllm.RoleAssistant, Content: text},
 			FinishReason: anyllm.FinishReasonStop,
 		}},
-		Usage: &anyllm.Usage{PromptTokens: 10, CompletionTokens: 5},
+		Usage: &anyllm.Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15},
 	}
 }
