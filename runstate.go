@@ -14,9 +14,6 @@ type runState struct {
 
 	// Keyed by ToolCallID. Populated by TodoWriteTool / TodoReadTool (chunk 16).
 	todos sync.Map // map[string][]TodoItem
-
-	// Keyed by agent name. Populated by Compactor middleware (chunk 14).
-	compactState sync.Map // map[string]*compactWatermark
 }
 
 func newRunState(maxTotalTokens int) *runState {

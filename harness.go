@@ -184,6 +184,8 @@ func (h *Harness) Run(ctx context.Context, in RunInput) (RunOutput, error) {
 }
 
 func (h *Harness) runLoop(ctx context.Context, spec AgentSpec, in RunInput, parentName string, depth int, rs *runState) (RunOutput, error) {
+	ctx = WithCompactStore(ctx, &syncMapCompactStore{})
+
 	agentInfo := AgentInfo{
 		Name:       spec.Name,
 		ParentName: parentName,
