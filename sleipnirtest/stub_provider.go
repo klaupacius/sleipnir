@@ -41,6 +41,20 @@ func (s *StubProvider) CompletionStream(_ context.Context, _ anyllm.CompletionPa
 	panic("StubProvider: CompletionStream not implemented")
 }
 
+// MultiToolCallResponse returns a *ChatCompletion scripted to call multiple tools in a single turn.
+func MultiToolCallResponse(calls ...anyllm.ToolCall) *anyllm.ChatCompletion {
+	return &anyllm.ChatCompletion{
+		Choices: []anyllm.Choice{{
+			Message: anyllm.Message{
+				Role:      anyllm.RoleAssistant,
+				ToolCalls: calls,
+			},
+			FinishReason: anyllm.FinishReasonToolCalls,
+		}},
+		Usage: &anyllm.Usage{PromptTokens: 10, CompletionTokens: 5},
+	}
+}
+
 // ToolCallResponse returns a *ChatCompletion scripted to call one tool.
 func ToolCallResponse(toolName, toolCallID string, args json.RawMessage) *anyllm.ChatCompletion {
 	return &anyllm.ChatCompletion{

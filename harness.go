@@ -137,7 +137,9 @@ func (h *Harness) Run(ctx context.Context, in RunInput) (RunOutput, error) {
 }
 
 func (h *Harness) runLoop(ctx context.Context, in RunInput, spec AgentSpec, info AgentInfo) (RunOutput, error) {
-	allTools := spec.Tools // ExtraTools merging comes in chunk 9
+	allTools := make([]Tool, 0, len(spec.Tools)+len(in.ExtraTools))
+	allTools = append(allTools, spec.Tools...)
+	allTools = append(allTools, in.ExtraTools...)
 
 	if err := validateToolNames(allTools); err != nil {
 		return RunOutput{}, err
@@ -214,7 +216,7 @@ func (h *Harness) runLoop(ctx context.Context, in RunInput, spec AgentSpec, info
 			return out, nil
 		}
 
-		toolResults := dispatchSequential(ctx, resp.Message.ToolCalls, toolMap, spec.Name, in.Events)
+		toolResults := dispatchInParallel(ctx, resp.Message.ToolCalls, toolMap, spec.Name, in.Events, spec.MaxParallelTools)
 		history = append(history, toolResultMessages(toolResults)...)
 	}
 
@@ -228,43 +230,65 @@ type toolCallResult struct {
 	infraErr error
 }
 
-func dispatchSequential(
+func dispatchInParallel(
 	ctx context.Context,
 	calls []anyllm.ToolCall,
 	toolMap map[string]Tool,
 	agentName string,
 	sink Sink,
+	maxParallel int,
 ) []toolCallResult {
 	results := make([]toolCallResult, len(calls))
+	sem := make(chan struct{}, maxParallel)
+	var wg sync.WaitGroup
+
 	for i, call := range calls {
-		emit(sink, ToolCallEvent{
-			AgentName:  agentName,
-			ToolCallID: call.ID,
-			ToolName:   call.Function.Name,
-			Args:       json.RawMessage(call.Function.Arguments),
-		})
+		wg.Add(1)
+		go func(i int, call anyllm.ToolCall) {
+			defer wg.Done()
 
-		tool, ok := toolMap[call.Function.Name]
-		var res ToolResult
-		var infraErr error
-		if !ok {
-			res = ToolResult{IsError: true, Content: "unknown tool: " + call.Function.Name}
-		} else {
-			res, infraErr = tool.Invoke(ctx, json.RawMessage(call.Function.Arguments))
-			if infraErr != nil {
-				res = ToolResult{IsError: true, Content: "tool execution failed: " + infraErr.Error()}
-				emit(sink, ErrorEvent{AgentName: agentName, Err: infraErr})
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				results[i] = toolCallResult{
+					callID:   call.ID,
+					result:   ToolResult{IsError: true, Content: "context cancelled"},
+					infraErr: ctx.Err(),
+				}
+				return
 			}
-		}
+			defer func() { <-sem }()
 
-		emit(sink, ToolResultEvent{
-			AgentName:  agentName,
-			ToolCallID: call.ID,
-			Result:     res.Content,
-			IsError:    res.IsError,
-		})
-		results[i] = toolCallResult{callID: call.ID, result: res, infraErr: infraErr}
+			emit(sink, ToolCallEvent{
+				AgentName:  agentName,
+				ToolCallID: call.ID,
+				ToolName:   call.Function.Name,
+				Args:       json.RawMessage(call.Function.Arguments),
+			})
+
+			tool, ok := toolMap[call.Function.Name]
+			var res ToolResult
+			var infraErr error
+			if !ok {
+				res = ToolResult{IsError: true, Content: "unknown tool: " + call.Function.Name}
+			} else {
+				res, infraErr = tool.Invoke(ctx, json.RawMessage(call.Function.Arguments))
+				if infraErr != nil {
+					res = ToolResult{IsError: true, Content: "tool execution failed: " + infraErr.Error()}
+					emit(sink, ErrorEvent{AgentName: agentName, Err: infraErr})
+				}
+			}
+
+			emit(sink, ToolResultEvent{
+				AgentName:  agentName,
+				ToolCallID: call.ID,
+				Result:     res.Content,
+				IsError:    res.IsError,
+			})
+			results[i] = toolCallResult{callID: call.ID, result: res, infraErr: infraErr}
+		}(i, call)
 	}
+	wg.Wait()
 	return results
 }
 
@@ -287,6 +311,9 @@ func emit(sink Sink, e Event) {
 }
 
 func callProvider(ctx context.Context, req LLMRequest) (LLMResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return LLMResponse{}, err
+	}
 	params := anyllm.CompletionParams{
 		Model:           req.Model.Model,
 		Messages:        req.Messages,
