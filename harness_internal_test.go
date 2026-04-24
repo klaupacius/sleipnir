@@ -1,6 +1,27 @@
 package sleipnir
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
+
+// TestStopReasonForErrContextCancelled verifies stopReasonForErr maps context.Canceled
+// to StopContextCancelled.
+func TestStopReasonForErrContextCancelled(t *testing.T) {
+	got := stopReasonForErr(context.Canceled)
+	if got != StopContextCancelled {
+		t.Errorf("stopReasonForErr(context.Canceled) = %q, want %q", got, StopContextCancelled)
+	}
+}
+
+// TestStopReasonForErrContextTimeout verifies stopReasonForErr maps context.DeadlineExceeded
+// to StopContextTimeout.
+func TestStopReasonForErrContextTimeout(t *testing.T) {
+	got := stopReasonForErr(context.DeadlineExceeded)
+	if got != StopContextTimeout {
+		t.Errorf("stopReasonForErr(context.DeadlineExceeded) = %q, want %q", got, StopContextTimeout)
+	}
+}
 
 // Spec with MaxIterations: 0 -> stored spec has cfg.DefaultMaxIterations
 func TestRegisterAgentResolvesZeros(t *testing.T) {

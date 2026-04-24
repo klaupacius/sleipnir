@@ -15,7 +15,7 @@ func Reflect[T any]() (m map[string]any, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("schema: reflection panicked for %s: %v",
-				reflect.TypeFor[T]().Name(), r)
+				reflect.TypeFor[T]().String(), r)
 		}
 	}()
 

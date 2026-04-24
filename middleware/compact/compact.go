@@ -67,7 +67,7 @@ func (c *Compactor) RewriteBeforeLLMCall(ctx context.Context, req *sleipnir.LLMR
 
 	summary, err := c.summarize(ctx, toCompact)
 	if err != nil {
-		return fmt.Errorf("compaction failed: %w", err)
+		return fmt.Errorf("%w: %w", sleipnir.ErrCompactionFailed, err)
 	}
 
 	summaryMsg := anyllm.Message{

@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	mcp "github.com/modelcontextprotocol/go-sdk/mcp"
 	sleipnir "sleipnir.dev/sleipnir"
@@ -77,16 +78,16 @@ func LoadTools(ctx context.Context, client *mcp.ClientSession, opts ...Option) (
 					return sleipnir.ToolResult{}, fmt.Errorf("mcpadapter: call %q: %w", mt.Name, err)
 				}
 
-				// Extract the first text content from the result.
-				var content string
+				var sb strings.Builder
 				for _, c := range result.Content {
 					if tc, ok := c.(*mcp.TextContent); ok {
-						content = tc.Text
-						break
+						sb.WriteString(tc.Text)
+					} else {
+						sb.WriteString("[non-text content]")
 					}
 				}
 				return sleipnir.ToolResult{
-					Content: content,
+					Content: sb.String(),
 					IsError: result.IsError,
 				}, nil
 			},

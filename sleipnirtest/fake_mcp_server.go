@@ -58,6 +58,30 @@ func (f *FakeMCPServer) AddTool(name, description string, fn func(ctx context.Co
 	)
 }
 
+// AddRawTool registers a tool whose handler returns a raw *mcp.CallToolResult.
+// Use this when you need to return multiple content items or non-text content.
+// Must be called before Start.
+func (f *FakeMCPServer) AddRawTool(name, description string, fn func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error)) {
+	f.t.Helper()
+	inputSchema := json.RawMessage(`{"type":"object"}`)
+	f.server.AddTool(
+		&mcp.Tool{
+			Name:        name,
+			Description: description,
+			InputSchema: inputSchema,
+		},
+		func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			var args map[string]any
+			if len(req.Params.Arguments) > 0 {
+				if err := json.Unmarshal(req.Params.Arguments, &args); err != nil {
+					return nil, err
+				}
+			}
+			return fn(ctx, args)
+		},
+	)
+}
+
 // Start connects the server and client in-process and registers cleanup.
 // Must be called before Client().
 func (f *FakeMCPServer) Start() {

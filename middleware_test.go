@@ -3,12 +3,14 @@ package sleipnir_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	sleipnir "sleipnir.dev/sleipnir"
+	"sleipnir.dev/sleipnir/middleware/compact"
 	"sleipnir.dev/sleipnir/sleipnirtest"
 
 	anyllm "github.com/mozilla-ai/any-llm-go"
@@ -553,5 +555,73 @@ func TestMultipleObserversAllCalled(t *testing.T) {
 	}
 	if !obsB.wasSeen() {
 		t.Error("observer B was not called")
+	}
+}
+
+// TestCompactionHistoryPropagates verifies that after a ContextRewriter compacts
+// req.Messages, the compacted history is used on subsequent iterations rather
+// than the original full history. The compact provider is scripted with a single
+// summarization response; if compaction fires a second time (due to the bug), the
+// StubProvider calls t.Fatalf and the test fails.
+func TestCompactionHistoryPropagates(t *testing.T) {
+	_ = strings.Repeat // import used below
+	toolName := "noop"
+
+	// 4 messages × 800 chars = 800 tokens; threshold 0.75×1000 = 750. Compaction fires.
+	bigContent := strings.Repeat("x", 800)
+	initialHistory := []anyllm.Message{
+		{Role: anyllm.RoleUser, Content: bigContent},
+		{Role: anyllm.RoleAssistant, Content: bigContent},
+		{Role: anyllm.RoleUser, Content: bigContent},
+		{Role: anyllm.RoleAssistant, Content: bigContent},
+	}
+
+	mainStub := sleipnirtest.NewStubProvider(t,
+		sleipnirtest.ToolCallResponse(toolName, "tc1", []byte(`{}`)),
+		sleipnirtest.TextResponse("done"),
+	)
+	cap := &captureProvider{inner: mainStub}
+
+	// Exactly 1 scripted summarization response. A second compaction call would
+	// trigger t.Fatalf inside StubProvider, failing the test.
+	compactStub := sleipnirtest.NewStubProvider(t, sleipnirtest.TextResponse("summary"))
+	compactor := compact.NewCompactor(compact.Config{
+		Provider:      compactStub,
+		Model:         "stub",
+		Threshold:     0.75,
+		ContextWindow: 1000,
+	})
+
+	h := mustNewHarness(t, sleipnir.Config{
+		Middlewares: []sleipnir.Middleware{compactor},
+	})
+	if err := h.RegisterAgent(sleipnir.AgentSpec{
+		Name:          "a",
+		MaxIterations: 5,
+		Tools:         []sleipnir.Tool{sleipnirtest.StaticTool(toolName, "result")},
+	}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+
+	_, err := h.Run(context.Background(), sleipnir.RunInput{
+		AgentName: "a",
+		History:   initialHistory,
+		Router:    defaultRouter(cap),
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	allParams := cap.allParams()
+	if len(allParams) < 2 {
+		t.Fatalf("expected at least 2 provider calls, got %d", len(allParams))
+	}
+	// With fix: second call gets compacted history + 2 new messages (tool call + result).
+	// Without fix: second call gets all 4 original messages + 2 new messages, triggering
+	// a second compaction (caught by the scripted stub above).
+	secondCount := len(allParams[1].Messages)
+	if secondCount > len(allParams[0].Messages)+2 {
+		t.Errorf("compaction did not propagate to history: second LLM call got %d messages, expected ≤ %d",
+			secondCount, len(allParams[0].Messages)+2)
 	}
 }

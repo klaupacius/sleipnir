@@ -34,6 +34,9 @@ Thumbs.db
 .env
 .env.local
 
+# Claude Code local overrides (personal; project settings.json may be committed)
+.claude/settings.local.json
+
 # Ephemeral progress notes
 PROGRESS.md
 
