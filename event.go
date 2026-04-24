@@ -13,9 +13,9 @@ const (
 )
 
 type TodoItem struct {
-	ID     string
-	Text   string
-	Status TodoStatus
+	ID     string     `json:"id"`
+	Text   string     `json:"text"`
+	Status TodoStatus `json:"status"`
 }
 
 type AgentStartEvent struct{ AgentName, ParentName string }
