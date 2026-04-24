@@ -39,6 +39,27 @@ no data; conversation history is an argument in and an argument out.
 go get sleipnir.dev/sleipnir
 ```
 
+## Examples
+
+Both examples use a scripted `demoProvider` and run without an API key.
+
+**`examples/hello/`** — minimal working harness: one agent, one typed tool, one
+custom event sink. Shows `NewHarness`, `RegisterAgent`, `NewTypedTool`, `Run`,
+and the `Sink` interface.
+
+```bash
+go run ./examples/hello/
+```
+
+**`examples/orchestrator/`** — parent agent dispatching two registered
+sub-agents. Demonstrates `AgentAsTool`, per-agent model routing via
+`MapRouter.Overrides`, `ExtraTools` with `OmitExtraToolsInheritance`, and an
+event log that collects then replays all agent lifecycle and tool events.
+
+```bash
+go run ./examples/orchestrator/
+```
+
 ## Concepts
 
 A `Harness` is the central object: you register one or more `AgentSpec` values
