@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -1800,10 +1801,7 @@ func TestAskUserToolParallel(t *testing.T) {
 		if n >= 2 {
 			break
 		}
-		// yield
-		var s sync.Mutex
-		s.Lock()
-		s.Unlock()
+		runtime.Gosched()
 	}
 	close(gate) // release both handlers
 
