@@ -1,6 +1,7 @@
 package sleipnirtest
 
 import (
+	"maps"
 	"sync"
 
 	"sleipnir.dev/sleipnir"
@@ -36,9 +37,7 @@ func (c *TodoCollector) All() map[string][]sleipnir.TodoItem {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	result := make(map[string][]sleipnir.TodoItem, len(c.latest))
-	for k, v := range c.latest {
-		result[k] = v
-	}
+	maps.Copy(result, c.latest)
 	return result
 }
 

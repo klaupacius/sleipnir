@@ -44,7 +44,6 @@ func LoadTools(ctx context.Context, client *mcp.ClientSession, opts ...Option) (
 
 	tools := make([]sleipnir.Tool, len(resp.Tools))
 	for i, mt := range resp.Tools {
-		mt := mt // capture for closure
 		name := cfg.prefix + mt.Name
 
 		// Convert MCP InputSchema (any) to map[string]any.
@@ -69,6 +68,7 @@ func LoadTools(ctx context.Context, client *mcp.ClientSession, opts ...Option) (
 					}
 				}
 
+				// Use original mt.Name on the wire; the prefixed name is only for the LLM.
 				result, err := client.CallTool(ctx, &mcp.CallToolParams{
 					Name:      mt.Name,
 					Arguments: argMap,
